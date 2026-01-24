@@ -1501,9 +1501,13 @@ impl CacheManager {
     /// * `key` - Cache key to invalidate
     ///
     /// # Example
-    /// ```rust,ignore
+    /// ```rust,no_run
+    /// # use multi_tier_cache::CacheManager;
+    /// # async fn example(cache_manager: &CacheManager) -> anyhow::Result<()> {
     /// // Invalidate user cache after profile update
     /// cache_manager.invalidate("user:123").await?;
+    /// # Ok(())
+    /// # }
     /// ```
     /// # Errors
     ///
@@ -1553,10 +1557,15 @@ impl CacheManager {
     /// * `ttl` - Optional TTL (uses default if None)
     ///
     /// # Example
-    /// ```rust,ignore
+    /// ```rust,no_run
+    /// # use multi_tier_cache::CacheManager;
+    /// # use std::time::Duration;
+    /// # async fn example(cache_manager: &CacheManager) -> anyhow::Result<()> {
     /// // Update user cache with new data
     /// let user_data = serde_json::json!({"id": 123, "name": "Alice"});
     /// cache_manager.update_cache("user:123", user_data, Some(Duration::from_secs(3600))).await?;
+    /// # Ok(())
+    /// # }
     /// ```
     /// # Errors
     ///
@@ -1611,12 +1620,16 @@ impl CacheManager {
     /// * `pattern` - Glob-style pattern (e.g., "user:*", "product:123:*")
     ///
     /// # Example
-    /// ```rust,ignore
+    /// ```rust,no_run
+    /// # use multi_tier_cache::CacheManager;
+    /// # async fn example(cache_manager: &CacheManager) -> anyhow::Result<()> {
     /// // Invalidate all user caches
     /// cache_manager.invalidate_pattern("user:*").await?;
     ///
     /// // Invalidate specific user's related caches
     /// cache_manager.invalidate_pattern("user:123:*").await?;
+    /// # Ok(())
+    /// # }
     /// ```
     /// # Errors
     ///
@@ -1686,10 +1699,14 @@ impl CacheManager {
     /// * `strategy` - Cache strategy (determines TTL)
     ///
     /// # Example
-    /// ```rust,ignore
+    /// ```rust,no_run
+    /// # use multi_tier_cache::{CacheManager, CacheStrategy};
+    /// # async fn example(cache_manager: &CacheManager) -> anyhow::Result<()> {
     /// // Update and broadcast in one call
     /// let data = serde_json::json!({"status": "active"});
     /// cache_manager.set_with_broadcast("user:123", data, CacheStrategy::MediumTerm).await?;
+    /// # Ok(())
+    /// # }
     /// ```
     /// # Errors
     ///

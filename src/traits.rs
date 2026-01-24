@@ -11,35 +11,32 @@
 //!
 //! # Example: Custom L1 Backend
 //!
-//! ```rust,ignore
-//! use multi_tier_cache::{CacheBackend, async_trait};
-//! use std::time::Duration;
-//! use anyhow::Result;
-//!
-//! struct MyCustomCache {
-//!     // Your implementation
-//! }
-//!
-//! #[async_trait]
-//! impl CacheBackend for MyCustomCache {
-//!     async fn get(&self, key: &str) -> Option<serde_json::Value> {
-//!         // Your implementation
-//!     }
-//!
-//!     async fn set_with_ttl(&self, key: &str, value: serde_json::Value, ttl: Duration) -> Result<()> {
-//!         // Your implementation
-//!     }
-//!
-//!     async fn remove(&self, key: &str) -> Result<()> {
-//!         // Your implementation
-//!     }
-//!
-//!     async fn health_check(&self) -> bool {
-//!         // Your implementation
-//!     }
-//! }
-//! ```
-
+/// ```rust,no_run
+/// use multi_tier_cache::{CacheBackend, async_trait};
+/// use std::time::Duration;
+/// use anyhow::Result;
+///
+/// struct MyCustomCache;
+///
+/// #[async_trait]
+/// impl CacheBackend for MyCustomCache {
+///     async fn get(&self, key: &str) -> Option<serde_json::Value> {
+///         None
+///     }
+///
+///     async fn set_with_ttl(&self, key: &str, value: serde_json::Value, ttl: Duration) -> Result<()> {
+///         Ok(())
+///     }
+///
+///     async fn remove(&self, key: &str) -> Result<()> {
+///         Ok(())
+///     }
+///
+///     async fn health_check(&self) -> bool {
+///         true
+///     }
+/// }
+/// ```
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json;
@@ -162,14 +159,26 @@ pub trait CacheBackend: Send + Sync {
 ///
 /// # Example
 ///
-/// ```rust,ignore
-/// use multi_tier_cache::{L2CacheBackend, async_trait};
+/// ```rust,no_run
+/// use multi_tier_cache::{CacheBackend, L2CacheBackend, async_trait};
+/// use std::time::Duration;
+/// use anyhow::Result;
+///
+/// struct MyDistributedCache;
+///
+/// #[async_trait]
+/// impl CacheBackend for MyDistributedCache {
+///     async fn get(&self, _key: &str) -> Option<serde_json::Value> { None }
+///     async fn set_with_ttl(&self, _k: &str, _v: serde_json::Value, _t: Duration) -> Result<()> { Ok(()) }
+///     async fn remove(&self, _k: &str) -> Result<()> { Ok(()) }
+///     async fn health_check(&self) -> bool { true }
+/// }
 ///
 /// #[async_trait]
 /// impl L2CacheBackend for MyDistributedCache {
 ///     async fn get_with_ttl(&self, key: &str) -> Option<(serde_json::Value, Option<Duration>)> {
 ///         // Retrieve value and calculate remaining TTL
-///         Some((value, Some(remaining_ttl)))
+///         None
 ///     }
 /// }
 /// ```
@@ -218,8 +227,11 @@ pub trait L2CacheBackend: CacheBackend {
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```rust,no_run
 /// use multi_tier_cache::{StreamingBackend, async_trait};
+/// use anyhow::Result;
+///
+/// struct MyStreamingCache;
 ///
 /// #[async_trait]
 /// impl StreamingBackend for MyStreamingCache {
@@ -229,10 +241,26 @@ pub trait L2CacheBackend: CacheBackend {
 ///         fields: Vec<(String, String)>,
 ///         maxlen: Option<usize>,
 ///     ) -> Result<String> {
-///         // Add entry to stream, return entry ID
+///         Ok("entry-id".to_string())
 ///     }
 ///
-///     // ... implement other methods
+///     async fn stream_read_latest(
+///         &self,
+///         stream_key: &str,
+///         count: usize,
+///     ) -> Result<Vec<(String, Vec<(String, String)>)>> {
+///         Ok(vec![])
+///     }
+///
+///     async fn stream_read(
+///         &self,
+///         stream_key: &str,
+///         last_id: &str,
+///         count: usize,
+///         block_ms: Option<usize>,
+///     ) -> Result<Vec<(String, Vec<(String, String)>)>> {
+///         Ok(vec![])
+///     }
 /// }
 /// ```
 #[async_trait]
