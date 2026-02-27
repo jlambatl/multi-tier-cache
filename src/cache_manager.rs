@@ -20,14 +20,19 @@ use super::invalidation::{
 use crate::backends::{L1Cache, L2Cache};
 use crate::traits::{CacheBackend, L2CacheBackend, StreamingBackend};
 
-/// Type alias for the in-flight requests map
-type InFlightMap = DashMap<String, Arc<Mutex<()>>>;
+/// Type alias for the in-flight requests map.
+///
+/// Uses `Arc<str>` instead of `String` to reduce per-request allocation overhead.
+/// When a cache key misses L1 and enters stampede protection, only one `Arc<str>`
+/// is allocated and then cheaply cloned (atomic refcount bump) for the `DashMap`
+/// entry and the `CleanupGuard`.
+type InFlightMap = DashMap<Arc<str>, Arc<Mutex<()>>>;
 
 /// RAII cleanup guard for in-flight request tracking
 /// Ensures that entries are removed from `DashMap` even on early return or panic
 struct CleanupGuard<'a> {
     map: &'a InFlightMap,
-    key: String,
+    key: Arc<str>,
 }
 
 impl Drop for CleanupGuard<'_> {
@@ -717,17 +722,17 @@ impl CacheManager {
             }
 
             // L1 miss - use stampede protection for lower tiers
-            let key_owned = key.to_string();
+            let key_arc: Arc<str> = Arc::from(key);
             let lock_guard = self
                 .in_flight_requests
-                .entry(key_owned.clone())
+                .entry(Arc::clone(&key_arc))
                 .or_insert_with(|| Arc::new(Mutex::new(())))
                 .clone();
 
             let _guard = lock_guard.lock().await;
             let cleanup_guard = CleanupGuard {
                 map: &self.in_flight_requests,
-                key: key_owned.clone(),
+                key: Arc::clone(&key_arc),
             };
 
             // Double-check L1 after acquiring lock
@@ -774,10 +779,10 @@ impl CacheManager {
         }
 
         // L1 miss - implement Cache Stampede protection for L2 lookup
-        let key_owned = key.to_string();
+        let key_arc: Arc<str> = Arc::from(key);
         let lock_guard = self
             .in_flight_requests
-            .entry(key_owned.clone())
+            .entry(Arc::clone(&key_arc))
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone();
 
@@ -786,7 +791,7 @@ impl CacheManager {
         // RAII cleanup guard - ensures entry is removed even on early return or panic
         let cleanup_guard = CleanupGuard {
             map: &self.in_flight_requests,
-            key: key_owned.clone(),
+            key: Arc::clone(&key_arc),
         };
 
         // Double-check L1 cache after acquiring lock
@@ -964,10 +969,10 @@ impl CacheManager {
         }
 
         // 2. L1 miss - try L2 with Cache Stampede protection
-        let key_owned = key.to_string();
+        let key_arc: Arc<str> = Arc::from(key);
         let lock_guard = self
             .in_flight_requests
-            .entry(key_owned.clone())
+            .entry(Arc::clone(&key_arc))
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone();
 
@@ -976,7 +981,7 @@ impl CacheManager {
         // RAII cleanup guard - ensures entry is removed even on early return or panic
         let _cleanup_guard = CleanupGuard {
             map: &self.in_flight_requests,
-            key: key_owned,
+            key: key_arc,
         };
 
         // 3. Double-check L1 cache after acquiring lock
@@ -1208,10 +1213,10 @@ impl CacheManager {
         }
 
         // 2. L1 miss - try L2 with Cache Stampede protection
-        let key_owned = key.to_string();
+        let key_arc: Arc<str> = Arc::from(key);
         let lock_guard = self
             .in_flight_requests
-            .entry(key_owned.clone())
+            .entry(Arc::clone(&key_arc))
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone();
 
@@ -1220,7 +1225,7 @@ impl CacheManager {
         // RAII cleanup guard - ensures entry is removed even on early return or panic
         let _cleanup_guard = CleanupGuard {
             map: &self.in_flight_requests,
-            key: key_owned,
+            key: key_arc,
         };
 
         // 3. Double-check L1 cache after acquiring lock
