@@ -864,21 +864,27 @@ impl CacheManager {
             let mut last_error = None;
             let tier_count = tiers.len();
 
-            // Clone for all tiers except the last; move the original into the last tier
-            let mut owned_value = Some(value);
-            for (i, tier) in tiers.iter().enumerate() {
-                let tier_value = if i == tier_count - 1 {
-                    // Last tier: move the original value (no clone)
-                    owned_value.take().expect("owned_value consumed only once")
-                } else {
-                    // Earlier tiers: clone
-                    owned_value.as_ref().expect("owned_value still available").clone()
-                };
+            // Clone for all tiers except the last; move the original into the last tier.
+            // Split into (init, last) to avoid Option/expect and eliminate one deep clone.
+            let (init_tiers, last_tier) = tiers.split_at(tier_count.saturating_sub(1));
 
-                match tier.set_with_ttl(key, tier_value, ttl).await {
-                    Ok(()) => {
-                        success_count += 1;
+            for tier in init_tiers {
+                match tier.set_with_ttl(key, value.clone(), ttl).await {
+                    Ok(()) => success_count += 1,
+                    Err(e) => {
+                        error!(
+                            "L{} cache set failed for key '{}': {}",
+                            tier.tier_level, key, e
+                        );
+                        last_error = Some(e);
                     }
+                }
+            }
+
+            // Last tier: move the original value (no clone)
+            if let Some(tier) = last_tier.first() {
+                match tier.set_with_ttl(key, value, ttl).await {
+                    Ok(()) => success_count += 1,
                     Err(e) => {
                         error!(
                             "L{} cache set failed for key '{}': {}",
