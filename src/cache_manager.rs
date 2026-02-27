@@ -837,9 +837,14 @@ impl CacheManager {
     ///
     /// Supports both legacy 2-tier mode and new multi-tier mode (v0.5.0+).
     /// In multi-tier mode, stores to ALL tiers with their respective TTL scaling.
+    ///
+    /// This method is optimized to avoid unnecessary cloning: it clones the value
+    /// for the first N-1 tiers and **moves** the original into the last tier,
+    /// saving one full deep clone of the JSON value per call.
+    ///
     /// # Errors
     ///
-    /// Returns an error if cache set operation fails.
+    /// Returns an error if all cache tiers fail to store the value.
     pub async fn set_with_strategy(
         &self,
         key: &str,
@@ -848,14 +853,24 @@ impl CacheManager {
     ) -> Result<()> {
         let ttl = strategy.to_duration();
 
-        // NEW: Multi-tier mode (v0.5.0+)
+        // Multi-tier mode (v0.5.0+)
         if let Some(tiers) = &self.tiers {
-            // Store in ALL tiers with their respective TTL scaling
             let mut success_count = 0;
             let mut last_error = None;
+            let tier_count = tiers.len();
 
-            for tier in tiers {
-                match tier.set_with_ttl(key, value.clone(), ttl).await {
+            // Clone for all tiers except the last; move the original into the last tier
+            let mut owned_value = Some(value);
+            for (i, tier) in tiers.iter().enumerate() {
+                let tier_value = if i == tier_count - 1 {
+                    // Last tier: move the original value (no clone)
+                    owned_value.take().expect("owned_value consumed only once")
+                } else {
+                    // Earlier tiers: clone
+                    owned_value.as_ref().expect("owned_value still available").clone()
+                };
+
+                match tier.set_with_ttl(key, tier_value, ttl).await {
                     Ok(()) => {
                         success_count += 1;
                     }
@@ -872,10 +887,7 @@ impl CacheManager {
             if success_count > 0 {
                 debug!(
                     "[Multi-Tier] Cached '{}' in {}/{} tiers (base TTL: {:?})",
-                    key,
-                    success_count,
-                    tiers.len(),
-                    ttl
+                    key, success_count, tier_count, ttl
                 );
                 return Ok(());
             }
@@ -884,36 +896,26 @@ impl CacheManager {
             );
         }
 
-        // LEGACY: 2-tier mode (L1 + L2)
-        // Store in both L1 and L2
+        // Legacy 2-tier mode (L1 + L2): clone for L1, move into L2
         let l1_result = self.l1_cache.set_with_ttl(key, value.clone(), ttl).await;
         let l2_result = self.l2_cache.set_with_ttl(key, value, ttl).await;
 
-        // Return success if at least one cache succeeded
         match (l1_result, l2_result) {
             (Ok(()), Ok(())) => {
-                // Both succeeded
                 debug!("[L1+L2] Cached '{}' with TTL {:?}", key, ttl);
                 Ok(())
             }
             (Ok(()), Err(_)) => {
-                // L1 succeeded, L2 failed
                 warn!("L2 cache set failed for key '{}', continuing with L1", key);
-                debug!("[L1] Cached '{}' with TTL {:?}", key, ttl);
                 Ok(())
             }
             (Err(_), Ok(())) => {
-                // L1 failed, L2 succeeded
                 warn!("L1 cache set failed for key '{}', continuing with L2", key);
-                debug!("[L2] Cached '{}' with TTL {:?}", key, ttl);
                 Ok(())
             }
-            (Err(e1), Err(_e2)) => {
-                // Both failed
-                Err(anyhow::anyhow!(
-                    "Both L1 and L2 cache set failed for key '{key}': {e1}"
-                ))
-            }
+            (Err(e1), Err(_e2)) => Err(anyhow::anyhow!(
+                "Both L1 and L2 cache set failed for key '{key}': {e1}"
+            )),
         }
     }
 
