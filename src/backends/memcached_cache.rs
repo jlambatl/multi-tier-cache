@@ -9,6 +9,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, info};
 
+use crate::utils::redact_url;
+
 /// Memcached distributed cache
 ///
 /// This is an alternative L2 (warm tier) cache backend, providing:
@@ -80,7 +82,7 @@ impl MemcachedCache {
         match client.version() {
             Ok(versions) => {
                 info!(
-                    url = %url,
+                    url = %redact_url(&memcached_url),
                     server_count = versions.len(),
                     "Memcached Cache connected successfully"
                 );
