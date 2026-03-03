@@ -365,25 +365,34 @@ impl<C: CacheCodec> CacheManager<C> {
         streaming_backend: Option<Arc<dyn StreamingBackend>>,
         codec: C,
     ) -> Result<Self> {
+        // Validation: At least one tier is required
+        if tiers.is_empty() {
+            anyhow::bail!("At least one cache tier is required");
+        }
+
         // Validation: Tiers must be sorted by tier_level
-        for i in 1..tiers.len() {
-            let prev = &tiers[i - 1];
-            let curr = &tiers[i];
-            if curr.tier_level <= prev.tier_level {
-                anyhow::bail!(
-                    "Tiers must be strictly ascending by level (found L{} after L{})",
-                    curr.tier_level,
-                    prev.tier_level
-                );
+        for w in tiers.windows(2) {
+            if let [prev, curr] = w {
+                if curr.tier_level <= prev.tier_level {
+                    anyhow::bail!(
+                        "Tiers must be strictly ascending by level (found L{} after L{})",
+                        curr.tier_level,
+                        prev.tier_level
+                    );
+                }
             }
         }
 
-        let l1_cache = tiers.first().unwrap().backend.clone();
-        let l2_cache = if tiers.len() >= 2 {
-            tiers[1].backend.clone()
-        } else {
-            l1_cache.clone()
-        };
+        let l1_cache = tiers
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("No tiers provided"))?
+            .backend
+            .clone();
+
+        let l2_cache = tiers
+            .get(1)
+            .map(|t| t.backend.clone())
+            .unwrap_or(l1_cache.clone());
 
         let l1_backend: Arc<dyn CacheBackend> = Arc::new(ProxyCacheBackend {
             backend: l1_cache.clone(),
@@ -433,6 +442,159 @@ impl<C: CacheCodec> CacheManager<C> {
         self.get_internal(key, true).await
     }
 
+    async fn get_multi_tier<T: DeserializeOwned>(
+        &self,
+        tiers: &[CacheTier],
+        key: &str,
+        allow_wait: bool,
+    ) -> Result<Option<T>> {
+        for (idx, tier) in tiers.iter().enumerate() {
+            // Tier fetch logic
+            let check_tier_fn = || async {
+                if let Some((value, ttl)) = tier.get_with_ttl(key).await {
+                    match self.inner.codec.deserialize(&value) {
+                        Ok(v) => Some((v, value, ttl)),
+                        Err(e) => {
+                            tracing::warn!(
+                                "Cache deserialization failed for key '{}' in L{}: {}",
+                                key,
+                                tier.tier_level,
+                                e
+                            );
+                            None
+                        }
+                    }
+                } else {
+                    None
+                }
+            };
+
+            let mut result = check_tier_fn().await;
+
+            // Hit on L1?
+            if result.is_some() && idx == 0 {
+                self.inner.l1_hits.fetch_add(1, Ordering::Relaxed);
+                tier.record_hit();
+                return Ok(result.map(|(v, _, _)| v));
+            }
+
+            // If this is L1 and we missed, check for stampede
+            if result.is_none() && idx == 0 && allow_wait {
+                let opt_mutex = self
+                    .inner
+                    .in_flight_requests
+                    .get(key)
+                    .map(|r| r.value().clone());
+
+                if let Some(mutex) = opt_mutex {
+                    // Wait for the leader
+                    let _unused = mutex.lock().await;
+                    // Retry L1 check
+                    result = check_tier_fn().await;
+                    if result.is_some() {
+                        self.inner.l1_hits.fetch_add(1, Ordering::Relaxed);
+                        tier.record_hit();
+                        return Ok(result.map(|(v, _, _)| v));
+                    }
+                }
+            }
+
+            if let Some((v, value, ttl)) = result {
+                tier.record_hit();
+
+                // Hit on Lower Tier (L2+) -> Promote to Upper Tiers
+                if idx >= 1 {
+                    self.inner.l2_hits.fetch_add(1, Ordering::Relaxed);
+                }
+
+                if tier.promotion_enabled {
+                    let promo_ttl = ttl.unwrap_or_else(|| CacheStrategy::Default.to_duration());
+                    // Promote to all tiers above this one
+                    for up in tiers.iter().take(idx).rev() {
+                        let _ = up.set_with_ttl(key, &value, promo_ttl).await;
+                        tracing::debug!(
+                            "Promoted '{}' from L{} to L{}",
+                            key,
+                            tier.tier_level,
+                            up.tier_level
+                        );
+                    }
+                    self.inner.promotions.fetch_add(1, Ordering::Relaxed);
+                }
+                return Ok(Some(v));
+            }
+        }
+        Ok(None)
+    }
+
+    async fn get_legacy<T: DeserializeOwned>(
+        &self,
+        key: &str,
+        allow_wait: bool,
+    ) -> Result<Option<T>> {
+        // 1. Check L1
+        if let Some(value) = self.inner.l1_cache.get(key).await {
+            match self.inner.codec.deserialize(&value) {
+                Ok(v) => {
+                    self.inner.l1_hits.fetch_add(1, Ordering::Relaxed);
+                    return Ok(Some(v));
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Cache deserialization failed for key '{}' in L1: {}",
+                        key,
+                        e
+                    );
+                }
+            }
+        }
+
+        // 2. Stampede Check (L1 Miss)
+        if allow_wait {
+            let opt_mutex = self
+                .inner
+                .in_flight_requests
+                .get(key)
+                .map(|r| r.value().clone());
+
+            if let Some(mutex) = opt_mutex {
+                let _unused = mutex.lock().await;
+                // Check L1 again
+                if let Some(value) = self.inner.l1_cache.get(key).await {
+                    if let Ok(v) = self.inner.codec.deserialize(&value) {
+                        self.inner.l1_hits.fetch_add(1, Ordering::Relaxed);
+                        return Ok(Some(v));
+                    }
+                }
+            }
+        }
+
+        // 3. Check L2
+        if let Some((value, ttl)) = self.inner.l2_cache.get_with_ttl(key).await {
+            match self.inner.codec.deserialize(&value) {
+                Ok(v) => {
+                    self.inner.l2_hits.fetch_add(1, Ordering::Relaxed);
+                    let promo_ttl = ttl.unwrap_or_else(|| CacheStrategy::Default.to_duration());
+                    let _ = self
+                        .inner
+                        .l1_cache
+                        .set_with_ttl(key, &value, promo_ttl)
+                        .await;
+                    self.inner.promotions.fetch_add(1, Ordering::Relaxed);
+                    return Ok(Some(v));
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Cache deserialization failed for key '{}' in L2: {}",
+                        key,
+                        e
+                    );
+                }
+            }
+        }
+        Ok(None)
+    }
+
     /// Internal get implementation with controllable stampede waiting
     async fn get_internal<T: DeserializeOwned>(
         &self,
@@ -441,155 +603,17 @@ impl<C: CacheCodec> CacheManager<C> {
     ) -> Result<Option<T>> {
         self.inner.total_requests.fetch_add(1, Ordering::Relaxed);
 
-        if let Some(tiers) = self.inner.tiers.as_ref() {
-            // Multi-tier
-            for (idx, tier) in tiers.iter().enumerate() {
-                // Tier fetch logic
-                let check_tier_fn = || async {
-                    if let Some((value, ttl)) = tier.get_with_ttl(key).await {
-                        match self.inner.codec.deserialize(&value) {
-                            Ok(v) => Some((v, value, ttl)),
-                            Err(e) => {
-                                tracing::warn!(
-                                    "Cache deserialization failed for key '{}' in L{}: {}",
-                                    key,
-                                    tier.tier_level,
-                                    e
-                                );
-                                None
-                            }
-                        }
-                    } else {
-                        None
-                    }
-                };
-
-                let mut result = check_tier_fn().await;
-
-                // Hit on L1?
-                if result.is_some() && idx == 0 {
-                    self.inner.l1_hits.fetch_add(1, Ordering::Relaxed);
-                    tier.record_hit();
-                    return Ok(result.map(|(v, _, _)| v));
-                }
-
-                // If this is L1 and we missed, check for stampede
-                if result.is_none() && idx == 0 && allow_wait {
-                    // Check if there is an in-flight request (READ Lock only)
-                    // We DO NOT insert a lock here to avoid contention (The "Hang" fix).
-                    // We only wait if someone else (get_or_compute) has initiated a fill.
-                    let opt_mutex = self
-                        .inner
-                        .in_flight_requests
-                        .get(key)
-                        .map(|r| r.value().clone());
-
-                    if let Some(mutex) = opt_mutex {
-                        // Wait for the leader
-                        let _unused = mutex.lock().await;
-                        // Retry L1 check
-                        result = check_tier_fn().await;
-                        if result.is_some() {
-                            self.inner.l1_hits.fetch_add(1, Ordering::Relaxed);
-                            tier.record_hit();
-                            return Ok(result.map(|(v, _, _)| v));
-                        }
-                    }
-                }
-
-                if let Some((v, value, ttl)) = result {
-                    // ADDED: Record hit
-                    tier.record_hit();
-
-                    // Hit on Lower Tier (L2+) -> Promote to Upper Tiers
-                    if idx >= 1 {
-                        self.inner.l2_hits.fetch_add(1, Ordering::Relaxed);
-                    }
-
-                    if tier.promotion_enabled {
-                        let promo_ttl = ttl.unwrap_or_else(|| CacheStrategy::Default.to_duration());
-                        // Promote to all tiers above this one
-                        for up in tiers.iter().take(idx).rev() {
-                            let _ = up.set_with_ttl(key, &value, promo_ttl).await;
-                            tracing::debug!(
-                                "Promoted '{}' from L{} to L{}",
-                                key,
-                                tier.tier_level,
-                                up.tier_level
-                            );
-                        }
-                        self.inner.promotions.fetch_add(1, Ordering::Relaxed);
-                    }
-                    return Ok(Some(v));
-                }
-            }
+        let result = if let Some(tiers) = self.inner.tiers.as_ref() {
+            self.get_multi_tier(tiers, key, allow_wait).await?
         } else {
-            // Legacy L1+L2
+            self.get_legacy(key, allow_wait).await?
+        };
 
-            // 1. Check L1
-            if let Some(value) = self.inner.l1_cache.get(key).await {
-                match self.inner.codec.deserialize(&value) {
-                    Ok(v) => {
-                        self.inner.l1_hits.fetch_add(1, Ordering::Relaxed);
-                        return Ok(Some(v));
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "Cache deserialization failed for key '{}' in L1: {}",
-                            key,
-                            e
-                        );
-                    }
-                }
-            }
-
-            // 2. Stampede Check (L1 Miss)
-            if allow_wait {
-                let opt_mutex = self
-                    .inner
-                    .in_flight_requests
-                    .get(key)
-                    .map(|r| r.value().clone());
-
-                if let Some(mutex) = opt_mutex {
-                    let _unused = mutex.lock().await;
-                    // Check L1 again
-                    if let Some(value) = self.inner.l1_cache.get(key).await {
-                        if let Ok(v) = self.inner.codec.deserialize(&value) {
-                            self.inner.l1_hits.fetch_add(1, Ordering::Relaxed);
-                            return Ok(Some(v));
-                        }
-                    }
-                }
-            }
-
-            // 3. Check L2
-            if let Some((value, ttl)) = self.inner.l2_cache.get_with_ttl(key).await {
-                match self.inner.codec.deserialize(&value) {
-                    Ok(v) => {
-                        self.inner.l2_hits.fetch_add(1, Ordering::Relaxed);
-                        let promo_ttl = ttl.unwrap_or_else(|| CacheStrategy::Default.to_duration());
-                        let _ = self
-                            .inner
-                            .l1_cache
-                            .set_with_ttl(key, &value, promo_ttl)
-                            .await;
-                        self.inner.promotions.fetch_add(1, Ordering::Relaxed);
-                        return Ok(Some(v));
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "Cache deserialization failed for key '{}' in L2: {}",
-                            key,
-                            e
-                        );
-                    }
-                }
-            }
+        if result.is_none() {
+            self.inner.misses.fetch_add(1, Ordering::Relaxed);
         }
 
-        self.inner.misses.fetch_add(1, Ordering::Relaxed);
-        Ok(None)
+        Ok(result)
     }
 
     /// Set (update) a value in all configured tiers.
@@ -724,7 +748,7 @@ impl<C: CacheCodec> CacheManager<C> {
     /// Invalidate (remove) a cached item from all tiers.
     ///
     /// This removes the given `key` from both L1 and L2 (or all tiers in N-tier config).
-    /// If an invalidation publisher is configured (e.g., Redis PubSub), it broadcasts
+    /// If an invalidation publisher is configured (e.g., Redis `PubSub`), it broadcasts
     /// an `Invalidate(key)` message to other instances.
     ///
     /// # Arguments

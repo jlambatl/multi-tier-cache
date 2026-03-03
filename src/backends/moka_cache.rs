@@ -166,7 +166,7 @@ impl CacheBackend for MokaCache {
         let mut keys_to_remove = Vec::new();
 
         // Use iter() to find keys matching the pattern
-        for (k, _v) in self.cache.iter() {
+        for (k, _v) in &self.cache {
             if pattern_owned.ends_with('*') {
                 let prefix = &pattern_owned[..pattern_owned.len() - 1];
                 if k.starts_with(prefix) {
