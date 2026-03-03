@@ -19,7 +19,7 @@ struct TestData {
 #[tokio::test]
 async fn test_sonic_codec_operations() -> Result<()> {
     // 1. Setup cache with Sonic codec
-    let cache = CacheSystem::with_codec(SonicRsCodec::new())?;
+    let cache = CacheSystem::with_codec(SonicRsCodec::new()).await?;
     let manager = cache.cache_manager();
 
     // 2. Prepare test data

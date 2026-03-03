@@ -1,7 +1,7 @@
 //! Benchmarks for serialization and type-safe caching
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
-use multi_tier_cache::{CacheStrategy, CacheSystem};
+use multi_tier_cache::{CacheStrategy, CacheSystem, CacheSystemBuilder};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::hint::black_box;
@@ -100,8 +100,13 @@ fn bench_json_vs_typed(c: &mut Criterion) {
     #[cfg(feature = "codec-sonic-rs")]
     group.bench_function("sonic_cache", |b| {
         use multi_tier_cache::codecs::SonicRsCodec;
-        let sonic_cache =
-            rt.block_on(async { CacheSystem::with_codec(SonicRsCodec::new()).unwrap() });
+        let sonic_cache = rt.block_on(async {
+            CacheSystemBuilder::new()
+                .with_codec(SonicRsCodec::new())
+                .build()
+                .await
+                .unwrap()
+        });
 
         b.iter(|| {
             rt.block_on(async {

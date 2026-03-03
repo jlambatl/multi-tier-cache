@@ -23,7 +23,10 @@ use crate::traits::{CacheBackend, CacheCodec, L2CacheBackend, StreamingBackend};
 /// Type alias for the in-flight requests map.
 type InFlightMap = DashMap<Arc<str>, Arc<Mutex<()>>>;
 
-/// RAII cleanup guard for in-flight request tracking
+/// RAII cleanup guard for in-flight request tracking.
+///
+/// Ensures that the request lock is removed from the `InFlightMap` when the guard goes out of scope,
+/// preventing stale locks even if the thread panics or returns early.
 struct CleanupGuard<'a> {
     map: &'a InFlightMap,
     key: Arc<str>,
@@ -258,14 +261,26 @@ pub struct CacheManagerInner<C: CacheCodec = JsonCodec> {
     invalidation_stats: Arc<AtomicInvalidationStats>,
 }
 
-/// Cache Manager
+/// Unified Cache Manager for L1/L2 and Multi-Tier operations
+///
+/// The `CacheManager` orchestrates all cache interactions, providing:
+/// - **Multi-Tier Logic**: Intelligently queries L1 -> L2 -> ... -> Back and promotes hot items.
+/// - **Cache Stampede Protection**: Uses `DashMap` + Mutex to coalesce identical requests for the same key.
+/// - **Serialization**: Handles typed `T` <-> `bytes` conversion via pluggable `CacheCodec`.
+/// - **Invalidation**: Publishes invalidation events if configured.
+/// - **Stats**: Tracks hits, misses, promotions, and in-flight requests.
+///
+/// # Type Parameters
+/// * `C`: The serialization codec (defaults to `JsonCodec`).
 #[derive(Clone)]
 pub struct CacheManager<C: CacheCodec = JsonCodec> {
     inner: Arc<CacheManagerInner<C>>,
 }
 
 impl<C: CacheCodec> CacheManager<C> {
-    /// Get stats
+    /// Get current cache statistics
+    ///
+    /// Returns a snapshot of performance metrics including hit rates and request counts.
     pub fn get_stats(&self) -> CacheManagerStats {
         let stats = CacheManagerStats {
             total_requests: self.inner.total_requests.load(Ordering::Relaxed),
@@ -287,7 +302,18 @@ impl<C: CacheCodec> CacheManager<C> {
         stats.calculate_hit_rates()
     }
 
-    /// Create with codec
+    /// Create a new `CacheManager` with a custom codec.
+    ///
+    /// # Arguments
+    ///
+    /// * `l1_cache` - The L1 (in-memory) cache backend.
+    /// * `l2_cache` - The L2 (distributed) cache backend.
+    /// * `streaming_backend` - Optional backend for event streams (e.g. Redis Streams).
+    /// * `codec` - The serialization implementation (e.g., `JsonCodec`, `PostcardCodec`).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Ok(Self)` on success. No I/O is performed during construction.
     pub fn with_codec(
         l1_cache: Arc<dyn CacheBackend>,
         l2_cache: Arc<dyn L2CacheBackend>,
@@ -315,7 +341,25 @@ impl<C: CacheCodec> CacheManager<C> {
         })
     }
 
-    /// Create with tiers and codec
+    /// Create a new `CacheManager` with multiple tiers and a custom codec.
+    ///
+    /// This constructor allows for N-tier architectures (e.g., L1 -> L2 -> L3) with
+    /// intelligent promotion and fallback strategies.
+    ///
+    /// # Arguments
+    ///
+    /// * `tiers` - Vector of configured `CacheTier` structs.
+    /// * `streaming_backend` - Optional streaming backend.
+    /// * `codec` - The serialization implementation.
+    ///
+    /// # Validation
+    ///
+    /// The `tiers` MUST be sorted by `tier_level` in ascending order (L1, L2, L3...).
+    /// If an out-of-order tier is detected (e.g., L3 before L2), this function will return an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if `tiers` are not strictly ascending by `tier_level`.
     pub fn with_tiers_and_codec(
         tiers: Vec<CacheTier>,
         streaming_backend: Option<Arc<dyn StreamingBackend>>,
@@ -366,7 +410,31 @@ impl<C: CacheCodec> CacheManager<C> {
         })
     }
 
-    /// Get value
+    /// Retrieve a value from the cache (Tiered L1 -> L2 -> ... -> L(n))
+    ///
+    /// # The Flow (Stampede Protected)
+    /// 1. **L1 Check**: Quickly check L1 (in-memory). If found, return immediately.
+    /// 2. **Stampede Lock**: If not found, acquire a key-specific `Mutex` to block redundant requests.
+    /// 3. **Double Check**: After acquiring the lock, check L1 again (another thread might have filled it).
+    /// 4. **L2+ Fetch**: Query downstream tiers (L2, L3...).
+    /// 5. **Promotion**: If found in a lower tier (e.g., L2), promote it to upper tiers (e.g., L1)
+    ///    with a scaled TTL to keep hot items fast.
+    /// 6. **Return**: Return `Some(T)` if found, or `None` if all tiers miss.
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - The cache key to retrieve.
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(Some(T))` - The deserialized value found in cache.
+    /// * `Ok(None)` - The value was not found in any tier.
+    /// * `Err(e)` - Serialization or IO error.
+    ///
+    /// # Notes
+    ///
+    /// If deserialization fails (e.g., corrupt data), this function logs a warning and
+    /// treats it as a **cache miss** (`Ok(None)`), allowing the application to recompute safely.
     pub async fn get<T: DeserializeOwned>(&self, key: &str) -> Result<Option<T>> {
         self.inner.total_requests.fetch_add(1, Ordering::Relaxed);
 
@@ -540,7 +608,23 @@ impl<C: CacheCodec> CacheManager<C> {
         Ok(None)
     }
 
-    /// Set value
+    /// Set (update) a value in all configured tiers.
+    ///
+    /// # The Flow
+    /// 1. Serialize the value `T` to bytes using the active `CacheCodec`.
+    /// 2. Iterate through all tiers (L1, L2, L3...).
+    /// 3. Store the bytes concurrently (or sequentially, depending on implementation).
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - The cache key.
+    /// * `value` - The value to store.
+    /// * `strategy` - The strategy determining the TTL (e.g., Short-Term, Long-Term).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if *all* tiers fail to store the value. If only some tiers fail,
+    /// it logs an error but returns `Ok(())` for the operation.
     pub async fn set_with_strategy<T: Serialize + ?Sized>(
         &self,
         key: &str,
@@ -573,7 +657,47 @@ impl<C: CacheCodec> CacheManager<C> {
         }
     }
 
-    /// Get or compute
+    /// Retrieve a value or compute it if missing (Stampede Protected).
+    ///
+    /// The `get_or_compute` method implements a classic "Read-Check-Compute" flow
+    /// with robust **Cache Stampede Protection**:
+    ///
+    /// 0. **Fast Get**: Check L1 (In-Memory) -> L2 (Redis).
+    /// 1. **Found**: Return `T` immediately.
+    /// 2. **Miss**: Acquire a `Mutex` for this *specific key* (other keys are unaffected).
+    /// 3. **Wait**: Wait for other requests for this key to potentially fill the cache.
+    /// 4. **Check Again**: Once lock acquired, check cache again.
+    /// 5. **Compute**: If still missing, run `compute_fn()`.
+    /// 6. **Fill**: Store result in L1 & L2 with `strategy` TTL.
+    /// 7. **Release**: Release lock to unblock other readers.
+    ///
+    /// # Type Parameters
+    ///
+    /// * `F`: Compute function returning a Future.
+    /// * `Fut`: The future returned by F, resolving to `Result<T>`.
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - The cache key.
+    /// * `strategy` - TTL strategy for storing the computed value.
+    /// * `compute_fn` - An async closure to call if the key is missing.
+    ///
+    /// # Example: API Call
+    ///
+    /// ```rust,no_run
+    /// # use multi_tier_cache::*;
+    /// # async fn fetch_user_api(id: u64) -> anyhow::Result<String> { Ok("alice".into()) }
+    /// # async fn example(cache: CacheManager) -> anyhow::Result<()> {
+    /// let user_id = 42;
+    /// let key = format!("user:{user_id}");
+    ///
+    /// // Only ONE request will hit the API even if 1000 requests arrive concurrently
+    /// let user = cache.get_or_compute(&key, CacheStrategy::ShortTerm, || {
+    ///     async move { fetch_user_api(user_id).await }
+    /// }).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn get_or_compute<T, F, Fut>(
         &self,
         key: &str,
@@ -613,7 +737,15 @@ impl<C: CacheCodec> CacheManager<C> {
         Ok(val)
     }
 
-    /// Invalidate key
+    /// Invalidate (remove) a cached item from all tiers.
+    ///
+    /// This removes the given `key` from both L1 and L2 (or all tiers in N-tier config).
+    /// If an invalidation publisher is configured (e.g., Redis PubSub), it broadcasts
+    /// an `Invalidate(key)` message to other instances.
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - The cache key to invalidate.
     pub async fn invalidate(&self, key: &str) -> Result<()> {
         if let Some(tiers) = &self.inner.tiers {
             for tier in tiers {
@@ -635,7 +767,18 @@ impl<C: CacheCodec> CacheManager<C> {
         Ok(())
     }
 
-    /// Update cache and broadcast
+    /// Update an item and broadcast the *new value* to other instances.
+    ///
+    /// This is a "Distributed Cache Update" - instead of invalidation (causing misses),
+    /// we proactively push the new value to peers.
+    ///
+    /// # Important
+    ///
+    /// This broadcasts the entire serialized payload. Use carefully.
+    ///
+    /// * `key` - The cache key to update.
+    /// * `value` - The new value.
+    /// * `strategy` - The strategy determining TTL.
     pub async fn update_cache<T: Serialize + ?Sized>(
         &self,
         key: &str,
@@ -667,7 +810,13 @@ impl<C: CacheCodec> CacheManager<C> {
         self.update_cache(key, value, strategy).await
     }
 
-    /// Invalidate pattern
+    /// Invalidate keys matching a glob pattern (e.g., `user:123:*`)
+    ///
+    /// # Important
+    ///
+    /// Requires a concrete L2 cache implementation (e.g., Redis) that supports `scan_keys`.
+    ///
+    /// * `pattern` - The wildcard pattern to invalidate.
     pub async fn invalidate_pattern(&self, pattern: &str) -> Result<()> {
         if let Some(tiers) = &self.inner.tiers {
             for tier in tiers {
@@ -693,6 +842,16 @@ impl<C: CacheCodec> CacheManager<C> {
     // ===== Streaming Methods =====
 
     /// Publish event to stream
+    ///
+    /// # Arguments
+    ///
+    /// * `stream_key` - Name of the stream (e.g. `events_v1`).
+    /// * `fields` - Key-value pairs to append to the stream.
+    /// * `maxlen` - Optional max length. If set, oldest entries are automatically trimmed.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if streaming is not configured or the backend fails.
     pub async fn publish_to_stream(
         &self,
         stream_key: &str,
@@ -706,7 +865,12 @@ impl<C: CacheCodec> CacheManager<C> {
         }
     }
 
-    /// Read latest events from stream
+    /// Read latest events from stream (LIFO-like access for initial load)
+    ///
+    /// # Arguments
+    ///
+    /// * `stream_key` - Stream name.
+    /// * `count` - Max number of recent entries to fetch.
     pub async fn read_stream_latest(
         &self,
         stream_key: &str,
@@ -719,7 +883,14 @@ impl<C: CacheCodec> CacheManager<C> {
         }
     }
 
-    /// Read events from stream (blocking)
+    /// Read events from stream (Blocking/Polling)
+    ///
+    /// # Arguments
+    ///
+    /// * `stream_key` - Stream name.
+    /// * `last_id` - ID of the last processed message (use `$` for new only, or `0-0` for all).
+    /// * `count` - Max number of entries to read.
+    /// * `block_ms` - If `Some(ms)`, block up to `ms` milliseconds waiting for new items.
     pub async fn read_stream(
         &self,
         stream_key: &str,

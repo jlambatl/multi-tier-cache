@@ -64,9 +64,9 @@ use tracing::{info, warn};
 pub mod backends;
 pub mod builder;
 pub mod cache_manager;
+pub mod codecs;
 pub mod invalidation;
 pub mod redis_streams;
-pub mod codecs;
 pub mod traits;
 pub mod utils;
 
@@ -143,6 +143,35 @@ pub struct CacheSystem<C: CacheCodec = JsonCodec> {
 }
 
 impl<C: CacheCodec> CacheSystem<C> {
+    /// Create new cache system with custom codec
+    ///
+    /// # Arguments
+    ///
+    /// * `codec` - Custom codec instance
+    pub async fn with_codec(codec: C) -> Result<Self> {
+        info!("Initializing Multi-Tier Cache System with custom codec");
+
+        // Initialize L1 cache (Moka)
+        let l1_cache = Arc::new(L1Cache::new(MokaCacheConfig::default())?);
+
+        // Initialize L2 cache (Redis)
+        let l2_cache = Arc::new(L2Cache::new().await?);
+
+        let l1_backend: Arc<dyn CacheBackend> = l1_cache.clone();
+        let l2_backend: Arc<dyn L2CacheBackend> = l2_cache.clone();
+
+        // Initialize cache manager
+        let cache_manager = CacheManager::with_codec(l1_backend, l2_backend, None, codec)?;
+
+        info!("Multi-Tier Cache System initialized successfully");
+
+        Ok(Self {
+            cache_manager: Arc::new(cache_manager),
+            l1_cache: Some(l1_cache),
+            l2_cache: Some(l2_cache),
+        })
+    }
+
     /// Perform health check on all cache tiers
     ///
     /// Returns `true` if at least L1 is operational.
@@ -252,8 +281,10 @@ impl CacheSystem<JsonCodec> {
         let l2_cache = Arc::new(L2Cache::with_url(redis_url).await?);
 
         // Initialize cache manager
-        let cache_manager =
-            Arc::new(CacheManager::new(Arc::clone(&l1_cache), Arc::clone(&l2_cache))?);
+        let cache_manager = Arc::new(CacheManager::new(
+            Arc::clone(&l1_cache),
+            Arc::clone(&l2_cache),
+        )?);
 
         info!("Multi-Tier Cache System initialized successfully");
 
