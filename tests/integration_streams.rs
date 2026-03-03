@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used)]
+#![allow(clippy::expect_used)]
 //! Integration tests for Redis Streams functionality
 
 mod common;
@@ -22,7 +24,7 @@ async fn test_stream_publish() {
         .cache_manager()
         .publish_to_stream(&stream_key, fields, Some(100))
         .await
-        .unwrap_or_else(|_| panic!("Failed to publish to stream"));
+        .unwrap_or_else(|e| panic!("Failed to publish to stream: {}", e));
 
     assert!(!entry_id.is_empty());
 }

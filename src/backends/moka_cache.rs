@@ -4,7 +4,6 @@
 
 use anyhow::Result;
 use moka::future::Cache;
-use serde_json;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -13,12 +12,12 @@ use tracing::{debug, info};
 /// Cache entry with TTL information
 #[derive(Debug, Clone)]
 struct CacheEntry {
-    value: serde_json::Value,
+    value: Vec<u8>,
     expires_at: Instant,
 }
 
 impl CacheEntry {
-    fn new(value: serde_json::Value, ttl: Duration) -> Self {
+    fn new(value: Vec<u8>, ttl: Duration) -> Self {
         Self {
             value,
             expires_at: Instant::now() + ttl,
@@ -103,7 +102,7 @@ impl MokaCache {
 
 // ===== Trait Implementations =====
 
-use crate::traits::CacheBackend;
+use crate::traits::{CacheBackend, L2CacheBackend};
 use async_trait::async_trait;
 
 /// Implement `CacheBackend` trait for `MokaCache`
@@ -111,7 +110,7 @@ use async_trait::async_trait;
 /// This allows `MokaCache` to be used as a pluggable backend in the multi-tier cache system.
 #[async_trait]
 impl CacheBackend for MokaCache {
-    async fn get(&self, key: &str) -> Option<serde_json::Value> {
+    async fn get(&self, key: &str) -> Option<Vec<u8>> {
         if let Some(entry) = self.cache.get(key).await {
             if entry.is_expired() {
                 // Remove expired entry
@@ -128,8 +127,8 @@ impl CacheBackend for MokaCache {
         }
     }
 
-    async fn set_with_ttl(&self, key: &str, value: serde_json::Value, ttl: Duration) -> Result<()> {
-        let entry = CacheEntry::new(value, ttl);
+    async fn set_with_ttl(&self, key: &str, value: &[u8], ttl: Duration) -> Result<()> {
+        let entry = CacheEntry::new(value.to_vec(), ttl);
         self.cache.insert(key.to_string(), entry).await;
         self.sets.fetch_add(1, Ordering::Relaxed);
         debug!(key = %key, ttl_secs = %ttl.as_secs(), "[Moka] Cached key with TTL");
@@ -144,10 +143,10 @@ impl CacheBackend for MokaCache {
     async fn health_check(&self) -> bool {
         // Test basic functionality with custom TTL
         let test_key = "health_check_moka";
-        let test_value = serde_json::json!({"test": true});
+        let test_value = b"health_check_value".to_vec();
 
         match self
-            .set_with_ttl(test_key, test_value.clone(), Duration::from_secs(60))
+            .set_with_ttl(test_key, &test_value, Duration::from_secs(60))
             .await
         {
             Ok(()) => match self.get(test_key).await {
@@ -164,21 +163,22 @@ impl CacheBackend for MokaCache {
     async fn remove_pattern(&self, pattern: &str) -> Result<()> {
         let pattern_owned = pattern.to_string();
 
-        // Use invalidate_entries_if for atomic removal of matching keys
-        // Note: Simple glob support (only supports trailing * for now)
-        let result = self.cache.invalidate_entries_if(move |k, _v| {
+        let mut keys_to_remove = Vec::new();
+
+        // Use iter() to find keys matching the pattern
+        for (k, _v) in &self.cache {
             if pattern_owned.ends_with('*') {
                 let prefix = &pattern_owned[..pattern_owned.len() - 1];
-                k.starts_with(prefix)
-            } else {
-                k == &pattern_owned
+                if k.starts_with(prefix) {
+                    keys_to_remove.push(k.as_ref().clone());
+                }
+            } else if k.as_str() == pattern_owned {
+                keys_to_remove.push(k.as_ref().clone());
             }
-        });
+        }
 
-        if let Err(e) = result {
-            return Err(anyhow::anyhow!(
-                "Moka invalidation failed for pattern '{pattern}': {e}"
-            ));
+        for k in keys_to_remove {
+            self.cache.remove(&k).await;
         }
 
         debug!("Invalidated pattern '{}' from Moka cache", pattern);
@@ -187,6 +187,32 @@ impl CacheBackend for MokaCache {
 
     fn name(&self) -> &'static str {
         "Moka"
+    }
+}
+
+/// Implement `L2CacheBackend` trait for `MokaCache`
+#[async_trait]
+impl L2CacheBackend for MokaCache {
+    async fn get_with_ttl(&self, key: &str) -> Option<(Vec<u8>, Option<Duration>)> {
+        if let Some(entry) = self.cache.get(key).await {
+            if entry.is_expired() {
+                let _ = self.cache.remove(key).await;
+                self.misses.fetch_add(1, Ordering::Relaxed);
+                None
+            } else {
+                self.hits.fetch_add(1, Ordering::Relaxed);
+                let now = Instant::now();
+                let ttl = if entry.expires_at > now {
+                    Some(entry.expires_at - now)
+                } else {
+                    None
+                };
+                Some((entry.value, ttl))
+            }
+        } else {
+            self.misses.fetch_add(1, Ordering::Relaxed);
+            None
+        }
     }
 }
 

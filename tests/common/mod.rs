@@ -57,7 +57,7 @@ pub async fn cleanup_test_keys(prefix: &str) -> Result<()> {
 
     // Find all test keys
     let pattern = format!("{prefix}*");
-    let keys = l2.scan_keys(&pattern).await?;
+    let keys = l2.scan_keys(&pattern, None).await?;
 
     // Remove them
     if !keys.is_empty() {

@@ -1,9 +1,12 @@
 //! Memcached Cache - Distributed Cache Backend
 //!
 //! Memcached-based distributed cache for warm data storage with simple key-value operations.
+//!
+//! All Memcached I/O is offloaded to blocking threads via `tokio::task::spawn_blocking`
+//! because the `memcache` crate is synchronous. This prevents blocking the async
+//! runtime's worker threads under load.
 
 use anyhow::{anyhow, Result};
-use serde_json;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,13 +22,16 @@ use crate::utils::redact_url;
 /// - LRU eviction policy
 /// - High throughput for read-heavy workloads
 ///
+/// All I/O operations are offloaded to blocking threads via
+/// `tokio::task::spawn_blocking` to avoid starving the async runtime.
+///
 /// **Note**: Unlike Redis, Memcached does not support:
 /// - TTL introspection (cannot get remaining TTL)
 /// - Persistence to disk
 /// - Advanced data structures
 pub struct MemcachedCache {
-    /// Memcached client
-    client: memcache::Client,
+    /// Memcached client (wrapped in Arc for sharing with blocking tasks)
+    client: Arc<memcache::Client>,
     /// Hit counter
     hits: Arc<AtomicU64>,
     /// Miss counter
@@ -72,7 +78,7 @@ impl MemcachedCache {
     ///
     /// Returns an error if the Memcached client cannot be created.
     pub fn with_url(url: &str) -> Result<Self> {
-        info!(url = %url, "Initializing Memcached Cache");
+        info!(url = %redact_url(url), "Initializing Memcached Cache");
 
         // Create Memcached client
         let client =
@@ -82,7 +88,7 @@ impl MemcachedCache {
         match client.version() {
             Ok(versions) => {
                 info!(
-                    url = %redact_url(&memcached_url),
+                    url = %redact_url(url),
                     server_count = versions.len(),
                     "Memcached Cache connected successfully"
                 );
@@ -93,7 +99,7 @@ impl MemcachedCache {
         }
 
         Ok(Self {
-            client,
+            client: Arc::new(client),
             hits: Arc::new(AtomicU64::new(0)),
             misses: Arc::new(AtomicU64::new(0)),
             sets: Arc::new(AtomicU64::new(0)),
@@ -107,13 +113,19 @@ impl MemcachedCache {
     ///
     /// # Errors
     ///
-    /// Returns an error if the Memcached client fails to retrieve statistics.
-    pub fn get_server_stats(
+    /// Returns an error if the Memcached client fails to retrieve statistics,
+    /// or if the blocking task panics.
+    pub async fn get_server_stats(
         &self,
     ) -> Result<Vec<(String, std::collections::HashMap<String, String>)>> {
-        self.client
-            .stats()
-            .map_err(|e| anyhow!("Failed to get Memcached stats: {e}"))
+        let client = Arc::clone(&self.client);
+        tokio::task::spawn_blocking(move || {
+            client
+                .stats()
+                .map_err(|e| anyhow!("Failed to get Memcached stats: {e}"))
+        })
+        .await
+        .map_err(|e| anyhow!("Memcached stats task panicked: {e}"))?
     }
 }
 
@@ -125,65 +137,74 @@ use async_trait::async_trait;
 /// Implement `CacheBackend` trait for `MemcachedCache`
 ///
 /// This allows `MemcachedCache` to be used as a pluggable backend in the multi-tier cache system.
+///
+/// All synchronous Memcached I/O is offloaded to blocking threads via
+/// `tokio::task::spawn_blocking` to prevent blocking the async runtime.
 #[async_trait]
 impl CacheBackend for MemcachedCache {
-    async fn get(&self, key: &str) -> Option<serde_json::Value> {
-        if let Ok(Some(json_str)) = self.client.get::<String>(key) {
-            if let Ok(value) = serde_json::from_str(&json_str) {
-                self.hits.fetch_add(1, Ordering::Relaxed);
-                Some(value)
-            } else {
-                self.misses.fetch_add(1, Ordering::Relaxed);
-                None
-            }
+    async fn get(&self, key: &str) -> Option<Vec<u8>> {
+        let client = Arc::clone(&self.client);
+        let key_owned = key.to_string();
+
+        let result = tokio::task::spawn_blocking(move || client.get::<Vec<u8>>(&key_owned))
+            .await
+            .ok()?;
+
+        if let Ok(Some(bytes)) = result {
+            self.hits.fetch_add(1, Ordering::Relaxed);
+            Some(bytes)
         } else {
             self.misses.fetch_add(1, Ordering::Relaxed);
             None
         }
     }
 
-    async fn set_with_ttl(&self, key: &str, value: serde_json::Value, ttl: Duration) -> Result<()> {
-        let json_str = serde_json::to_string(&value)?;
+    async fn set_with_ttl(&self, key: &str, value: &[u8], ttl: Duration) -> Result<()> {
+        let ttl_secs = u32::try_from(ttl.as_secs()).unwrap_or(u32::MAX);
+        let client = Arc::clone(&self.client);
+        let key_owned = key.to_string();
+        let value_owned = value.to_vec();
 
-        self.client
-            .set(
-                key,
-                json_str,
-                u32::try_from(ttl.as_secs()).unwrap_or(u32::MAX),
-            )
-            .map_err(|e| anyhow!("Memcached SET failed: {e}"))?;
+        tokio::task::spawn_blocking(move || {
+            client
+                .set(&key_owned, &value_owned[..], ttl_secs)
+                .map_err(|e| anyhow!("Memcached SET failed: {e}"))
+        })
+        .await
+        .map_err(|e| anyhow!("Memcached SET task panicked: {e}"))??;
 
         self.sets.fetch_add(1, Ordering::Relaxed);
-        debug!(key = %key, ttl_secs = %ttl.as_secs(), "[Memcached] Cached key with TTL");
+        debug!(key = %key, ttl_secs = %ttl_secs, "[Memcached] Cached key with TTL");
         Ok(())
     }
 
     async fn remove(&self, key: &str) -> Result<()> {
-        self.client
-            .delete(key)
-            .map_err(|e| anyhow!("Memcached DELETE failed: {e}"))?;
+        let client = Arc::clone(&self.client);
+        let key_owned = key.to_string();
+
+        tokio::task::spawn_blocking(move || {
+            client
+                .delete(&key_owned)
+                .map_err(|e| anyhow!("Memcached DELETE failed: {e}"))
+        })
+        .await
+        .map_err(|e| anyhow!("Memcached DELETE task panicked: {e}"))??;
+
         Ok(())
     }
 
     async fn health_check(&self) -> bool {
         let test_key = "health_check_memcached";
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or(Duration::from_secs(0))
-            .as_secs();
-        let test_value = serde_json::json!({"test": true, "timestamp": timestamp});
+        let test_value = b"health_check_value".to_vec();
 
         match self
-            .set_with_ttl(test_key, test_value.clone(), Duration::from_secs(10))
+            .set_with_ttl(test_key, &test_value, Duration::from_secs(10))
             .await
         {
             Ok(()) => match self.get(test_key).await {
                 Some(retrieved) => {
                     let _ = self.remove(test_key).await;
-                    retrieved
-                        .get("test")
-                        .and_then(serde_json::Value::as_bool)
-                        .unwrap_or(false)
+                    retrieved == test_value
                 }
                 None => false,
             },

@@ -20,11 +20,11 @@
 ///
 /// #[async_trait]
 /// impl CacheBackend for MyCustomCache {
-///     async fn get(&self, key: &str) -> Option<serde_json::Value> {
+///     async fn get(&self, key: &str) -> Option<Vec<u8>> {
 ///         None
 ///     }
 ///
-///     async fn set_with_ttl(&self, key: &str, value: serde_json::Value, ttl: Duration) -> Result<()> {
+///     async fn set_with_ttl(&self, key: &str, value: &[u8], ttl: Duration) -> Result<()> {
 ///         Ok(())
 ///     }
 ///
@@ -39,8 +39,25 @@
 /// ```
 use anyhow::Result;
 use async_trait::async_trait;
-use serde_json;
+use serde::de::DeserializeOwned;
+use serde::Serialize;
+use std::fmt::Debug;
 use std::time::Duration;
+
+/// Trait for cache serialization codecs
+///
+/// Codecs define how Rust types are serialized to bytes for storage and
+/// deserialized back into Rust types.
+pub trait CacheCodec: Send + Sync + Debug {
+    /// Serialize a value to bytes
+    fn serialize<T: Serialize + ?Sized>(&self, value: &T) -> Result<Vec<u8>>;
+
+    /// Deserialize bytes to a value
+    fn deserialize<T: DeserializeOwned>(&self, bytes: &[u8]) -> Result<T>;
+
+    /// Get the name of this codec
+    fn name(&self) -> &'static str;
+}
 
 /// Core cache backend trait for both L1 and L2 caches
 ///
@@ -63,10 +80,6 @@ use std::time::Duration;
 /// - `get` operations should be optimized for low latency (target: <1ms for L1, <5ms for L2)
 /// - `set_with_ttl` operations can be slightly slower but should still be fast
 /// - Consider connection pooling for distributed backends
-///
-/// # Example
-///
-/// See module-level documentation for a complete example.
 #[async_trait]
 pub trait CacheBackend: Send + Sync {
     /// Get value from cache by key
@@ -77,23 +90,23 @@ pub trait CacheBackend: Send + Sync {
     ///
     /// # Returns
     ///
-    /// * `Some(value)` - Value found in cache
+    /// * `Some(value)` - Value found in cache (as raw bytes)
     /// * `None` - Key not found or expired
-    async fn get(&self, key: &str) -> Option<serde_json::Value>;
+    async fn get(&self, key: &str) -> Option<Vec<u8>>;
 
     /// Set value in cache with time-to-live
     ///
     /// # Arguments
     ///
     /// * `key` - The cache key
-    /// * `value` - The value to store (must be JSON-serializable)
+    /// * `value` - The value to store (raw bytes)
     /// * `ttl` - Time-to-live duration
     ///
     /// # Returns
     ///
     /// * `Ok(())` - Value successfully cached
     /// * `Err(e)` - Cache operation failed
-    async fn set_with_ttl(&self, key: &str, value: serde_json::Value, ttl: Duration) -> Result<()>;
+    async fn set_with_ttl(&self, key: &str, value: &[u8], ttl: Duration) -> Result<()>;
 
     /// Remove value from cache
     ///
@@ -150,38 +163,6 @@ pub trait CacheBackend: Send + Sync {
 /// This trait extends `CacheBackend` with the ability to retrieve both a value
 /// and its remaining TTL. This is essential for implementing efficient L2-to-L1
 /// promotion with accurate TTL propagation.
-///
-/// # Use Cases
-///
-/// - L2-to-L1 promotion with same TTL
-/// - TTL-based cache warming strategies
-/// - Monitoring and analytics
-///
-/// # Example
-///
-/// ```rust,no_run
-/// use multi_tier_cache::{CacheBackend, L2CacheBackend, async_trait};
-/// use std::time::Duration;
-/// use anyhow::Result;
-///
-/// struct MyDistributedCache;
-///
-/// #[async_trait]
-/// impl CacheBackend for MyDistributedCache {
-///     async fn get(&self, _key: &str) -> Option<serde_json::Value> { None }
-///     async fn set_with_ttl(&self, _k: &str, _v: serde_json::Value, _t: Duration) -> Result<()> { Ok(()) }
-///     async fn remove(&self, _k: &str) -> Result<()> { Ok(()) }
-///     async fn health_check(&self) -> bool { true }
-/// }
-///
-/// #[async_trait]
-/// impl L2CacheBackend for MyDistributedCache {
-///     async fn get_with_ttl(&self, key: &str) -> Option<(serde_json::Value, Option<Duration>)> {
-///         // Retrieve value and calculate remaining TTL
-///         None
-///     }
-/// }
-/// ```
 #[async_trait]
 pub trait L2CacheBackend: CacheBackend {
     /// Get value with its remaining TTL from L2 cache
@@ -199,13 +180,7 @@ pub trait L2CacheBackend: CacheBackend {
     /// * `Some((value, Some(ttl)))` - Value found with remaining TTL
     /// * `Some((value, None))` - Value found but no expiration set (never expires)
     /// * `None` - Key not found or expired
-    ///
-    /// # TTL Semantics
-    ///
-    /// - TTL represents the **remaining** time until expiration
-    /// - `None` TTL means the key has no expiration
-    /// - Implementations should use backend-specific TTL commands (e.g., Redis TTL)
-    async fn get_with_ttl(&self, key: &str) -> Option<(serde_json::Value, Option<Duration>)>;
+    async fn get_with_ttl(&self, key: &str) -> Option<(Vec<u8>, Option<Duration>)>;
 }
 
 /// Optional trait for cache backends that support event streaming

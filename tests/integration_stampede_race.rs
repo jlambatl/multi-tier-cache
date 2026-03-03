@@ -1,12 +1,14 @@
+#![allow(clippy::unwrap_used)]
+#![allow(clippy::expect_used)]
 //! Stampede protection regression tests.
 //!
 //! ## Analysis of the TOCTOU concern
 //!
 //! The original code review (§1.2) noted a potential TOCTOU race where
-//! `CleanupGuard` removes the DashMap entry before mutex waiters wake up,
+//! `CleanupGuard` removes the `DashMap` entry before mutex waiters wake up,
 //! allowing a new request to create a new mutex and start duplicate work.
 //!
-//! After thorough analysis, **this is NOT exploitable in `get_or_compute_with`**:
+//! After thorough analysis, **this is NOT exploitable in `get_or_compute`**:
 //!
 //! 1. The mutex `_guard` is held through compute + `set_with_strategy`
 //! 2. `_cleanup_guard` drops first (Rust drops in reverse declaration order)
@@ -21,7 +23,7 @@
 
 use anyhow::Result;
 use multi_tier_cache::{
-    async_trait, CacheBackend, CacheManager, CacheStrategy, CacheTier, L2CacheBackend,
+    async_trait, CacheBackend, CacheManager, CacheStrategy, CacheTier, L2CacheBackend, JsonCodec,
 };
 use serde_json::json;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -35,7 +37,7 @@ use tokio::sync::Barrier;
 
 /// Simple in-memory backend for testing.
 struct InMemoryBackend {
-    store: dashmap::DashMap<String, serde_json::Value>,
+    store: dashmap::DashMap<String, Vec<u8>>,
 }
 
 impl InMemoryBackend {
@@ -48,17 +50,17 @@ impl InMemoryBackend {
 
 #[async_trait]
 impl CacheBackend for InMemoryBackend {
-    async fn get(&self, key: &str) -> Option<serde_json::Value> {
+    async fn get(&self, key: &str) -> Option<Vec<u8>> {
         self.store.get(key).map(|v| v.value().clone())
     }
 
     async fn set_with_ttl(
         &self,
         key: &str,
-        value: serde_json::Value,
+        value: &[u8],
         _ttl: Duration,
     ) -> Result<()> {
-        self.store.insert(key.to_string(), value);
+        self.store.insert(key.to_string(), value.to_vec());
         Ok(())
     }
 
@@ -78,7 +80,7 @@ impl CacheBackend for InMemoryBackend {
 
 #[async_trait]
 impl L2CacheBackend for InMemoryBackend {
-    async fn get_with_ttl(&self, key: &str) -> Option<(serde_json::Value, Option<Duration>)> {
+    async fn get_with_ttl(&self, key: &str) -> Option<(Vec<u8>, Option<Duration>)> {
         self.store
             .get(key)
             .map(|v| (v.value().clone(), Some(Duration::from_secs(300))))
@@ -87,7 +89,7 @@ impl L2CacheBackend for InMemoryBackend {
 
 /// Backend with configurable write delay to test edge cases.
 struct SlowWriteBackend {
-    store: dashmap::DashMap<String, serde_json::Value>,
+    store: dashmap::DashMap<String, Vec<u8>>,
     slow_writes: Arc<AtomicBool>,
     write_delay: Duration,
 }
@@ -104,20 +106,20 @@ impl SlowWriteBackend {
 
 #[async_trait]
 impl CacheBackend for SlowWriteBackend {
-    async fn get(&self, key: &str) -> Option<serde_json::Value> {
+    async fn get(&self, key: &str) -> Option<Vec<u8>> {
         self.store.get(key).map(|v| v.value().clone())
     }
 
     async fn set_with_ttl(
         &self,
         key: &str,
-        value: serde_json::Value,
+        value: &[u8],
         _ttl: Duration,
     ) -> Result<()> {
         if self.slow_writes.load(Ordering::SeqCst) {
             tokio::time::sleep(self.write_delay).await;
         }
-        self.store.insert(key.to_string(), value);
+        self.store.insert(key.to_string(), value.to_vec());
         Ok(())
     }
 
@@ -137,7 +139,7 @@ impl CacheBackend for SlowWriteBackend {
 
 #[async_trait]
 impl L2CacheBackend for SlowWriteBackend {
-    async fn get_with_ttl(&self, key: &str) -> Option<(serde_json::Value, Option<Duration>)> {
+    async fn get_with_ttl(&self, key: &str) -> Option<(Vec<u8>, Option<Duration>)> {
         self.store
             .get(key)
             .map(|v| (v.value().clone(), Some(Duration::from_secs(300))))
@@ -153,7 +155,7 @@ fn build_manager(l1: Arc<dyn L2CacheBackend>, l2: Arc<dyn L2CacheBackend>) -> Ar
         CacheTier::new(l1, 1, false, 1.0),
         CacheTier::new(l2, 2, true, 1.0),
     ];
-    Arc::new(CacheManager::new_with_tiers(tiers, None).expect("CacheManager"))
+    Arc::new(CacheManager::with_tiers_and_codec(tiers, None, JsonCodec::new()).expect("CacheManager"))
 }
 
 // =============================================================================
@@ -181,7 +183,7 @@ async fn test_stampede_single_compute_concurrent_requests() {
 
         handles.push(tokio::spawn(async move {
             b.wait().await;
-            mgr.get_or_compute_with(key, CacheStrategy::ShortTerm, || {
+            mgr.get_or_compute(key, CacheStrategy::ShortTerm, || {
                 let c = counter;
                 async move {
                     c.fetch_add(1, Ordering::SeqCst);
@@ -223,7 +225,7 @@ async fn test_stampede_no_recompute_after_cached() {
     {
         let counter = Arc::clone(&compute_count);
         manager
-            .get_or_compute_with(key, CacheStrategy::ShortTerm, || {
+            .get_or_compute(key, CacheStrategy::ShortTerm, || {
                 let c = counter;
                 async move {
                     c.fetch_add(1, Ordering::SeqCst);
@@ -248,7 +250,7 @@ async fn test_stampede_no_recompute_after_cached() {
 
         handles.push(tokio::spawn(async move {
             b.wait().await;
-            mgr.get_or_compute_with(key, CacheStrategy::ShortTerm, || {
+            mgr.get_or_compute(key, CacheStrategy::ShortTerm, || {
                 let c = counter;
                 async move {
                     c.fetch_add(1, Ordering::SeqCst);
@@ -294,7 +296,7 @@ async fn test_stampede_two_waves_single_compute() {
 
         handles.push(tokio::spawn(async move {
             b.wait().await;
-            mgr.get_or_compute_with(key, CacheStrategy::ShortTerm, || {
+            mgr.get_or_compute(key, CacheStrategy::ShortTerm, || {
                 let c = counter;
                 async move {
                     c.fetch_add(1, Ordering::SeqCst);
@@ -316,7 +318,7 @@ async fn test_stampede_two_waves_single_compute() {
         let counter = Arc::clone(&compute_count);
 
         handles.push(tokio::spawn(async move {
-            mgr.get_or_compute_with(key, CacheStrategy::ShortTerm, || {
+            mgr.get_or_compute(key, CacheStrategy::ShortTerm, || {
                 let c = counter;
                 async move {
                     c.fetch_add(1, Ordering::SeqCst);
@@ -340,7 +342,7 @@ async fn test_stampede_two_waves_single_compute() {
 }
 
 /// Even with slow L1 writes, stampede protection should prevent duplicate
-/// computation because the mutex is held through the entire set_with_strategy call.
+/// computation because the mutex is held through the entire `set_with_strategy` call.
 #[tokio::test]
 async fn test_stampede_safe_with_slow_writes() {
     let compute_count = Arc::new(AtomicUsize::new(0));
@@ -370,7 +372,7 @@ async fn test_stampede_safe_with_slow_writes() {
 
         handles.push(tokio::spawn(async move {
             b.wait().await;
-            mgr.get_or_compute_with(key, CacheStrategy::ShortTerm, || {
+            mgr.get_or_compute(key, CacheStrategy::ShortTerm, || {
                 let c = counter;
                 async move {
                     c.fetch_add(1, Ordering::SeqCst);
@@ -392,7 +394,7 @@ async fn test_stampede_safe_with_slow_writes() {
         let counter = Arc::clone(&compute_count);
 
         handles.push(tokio::spawn(async move {
-            mgr.get_or_compute_with(key, CacheStrategy::ShortTerm, || {
+            mgr.get_or_compute(key, CacheStrategy::ShortTerm, || {
                 let c = counter;
                 async move {
                     c.fetch_add(1, Ordering::SeqCst);
@@ -443,7 +445,7 @@ async fn test_stampede_multi_key_isolation() {
                 let key = format!("stampede:multi:{key_id}");
                 b.wait().await;
 
-                mgr.get_or_compute_with(&key, CacheStrategy::ShortTerm, || {
+                mgr.get_or_compute(&key, CacheStrategy::ShortTerm, || {
                     let k = key.clone();
                     let c = Arc::clone(&counts);
                     async move {
@@ -469,8 +471,7 @@ async fn test_stampede_multi_key_isolation() {
         let key = format!("stampede:multi:{key_id}");
         let count = compute_counts
             .get(&key)
-            .map(|v| v.load(Ordering::SeqCst))
-            .unwrap_or(0);
+            .map_or(0, |v| v.load(Ordering::SeqCst));
 
         assert_eq!(count, 1, "Key '{key}' computed {count} times (expected 1)");
     }

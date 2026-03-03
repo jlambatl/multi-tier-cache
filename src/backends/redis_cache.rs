@@ -5,11 +5,10 @@
 use anyhow::{Context, Result};
 use redis::aio::ConnectionManager;
 use redis::{AsyncCommands, Client};
-use serde_json;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::utils::redact_url;
 
@@ -54,8 +53,12 @@ impl RedisCache {
     pub async fn with_url(redis_url: &str) -> Result<Self> {
         info!(redis_url = %redact_url(redis_url), "Initializing Redis Cache with ConnectionManager");
 
-        let client = Client::open(redis_url)
-            .with_context(|| format!("Failed to create Redis client with URL: {}", redact_url(redis_url)))?;
+        let client = Client::open(redis_url).with_context(|| {
+            format!(
+                "Failed to create Redis client with URL: {}",
+                redact_url(redis_url)
+            )
+        })?;
 
         // Create ConnectionManager - handles reconnection automatically
         let conn_manager = ConnectionManager::new(client)
@@ -96,22 +99,28 @@ impl RedisCache {
     /// # async fn example() -> anyhow::Result<()> {
     /// # let cache = RedisCache::new().await?;
     /// // Find all user cache keys
-    /// let keys = cache.scan_keys("user:*").await?;
+    /// let keys = cache.scan_keys("user:*", None).await?;
     ///
     /// // Find specific user's cache keys
-    /// let keys = cache.scan_keys("user:123:*").await?;
+    /// let keys = cache.scan_keys("user:123:*", None).await?;
     /// # Ok(())
     /// # }
     /// ```
     /// # Errors
     ///
     /// Returns an error if the Redis command fails.
-    pub async fn scan_keys(&self, pattern: &str) -> Result<Vec<String>> {
+    pub async fn scan_keys(&self, pattern: &str, limit: Option<usize>) -> Result<Vec<String>> {
         let mut conn = self.conn_manager.clone();
         let mut keys = Vec::new();
         let mut cursor: u64 = 0;
 
         loop {
+            if let Some(limit_val) = limit {
+                if keys.len() >= limit_val {
+                    break;
+                }
+            }
+
             // SCAN cursor MATCH pattern COUNT 100
             let result: (u64, Vec<String>) = redis::cmd("SCAN")
                 .arg(cursor)
@@ -128,6 +137,12 @@ impl RedisCache {
             // Cursor 0 means iteration is complete
             if cursor == 0 {
                 break;
+            }
+        }
+
+        if let Some(limit_val) = limit {
+            if keys.len() > limit_val {
+                keys.truncate(limit_val);
             }
         }
 
@@ -163,38 +178,31 @@ use async_trait::async_trait;
 /// This allows `RedisCache` to be used as a pluggable backend in the multi-tier cache system.
 #[async_trait]
 impl CacheBackend for RedisCache {
-    async fn get(&self, key: &str) -> Option<serde_json::Value> {
+    async fn get(&self, key: &str) -> Option<Vec<u8>> {
         let mut conn = self.conn_manager.clone();
 
-        if let Ok(json_str) = conn.get::<_, String>(key).await {
-            match serde_json::from_str(&json_str) {
-                Ok(value) => {
-                    self.hits.fetch_add(1, Ordering::Relaxed);
-                    Some(value)
-                }
-                Err(e) => {
-                    warn!(
-                        key = %key,
-                        error = %e,
-                        "[Redis] Deserialization failed for cached value — returning None"
-                    );
-                    self.misses.fetch_add(1, Ordering::Relaxed);
-                    None
-                }
+        match conn.get::<_, Vec<u8>>(key).await {
+            Ok(bytes) if !bytes.is_empty() => {
+                self.hits.fetch_add(1, Ordering::Relaxed);
+                Some(bytes)
             }
-        } else {
-            self.misses.fetch_add(1, Ordering::Relaxed);
-            None
+            Ok(_) | Err(_) => {
+                // Empty bytes or error treated as miss
+                self.misses.fetch_add(1, Ordering::Relaxed);
+                None
+            }
         }
     }
 
-    async fn set_with_ttl(&self, key: &str, value: serde_json::Value, ttl: Duration) -> Result<()> {
-        let json_str = serde_json::to_string(&value)?;
+    async fn set_with_ttl(&self, key: &str, value: &[u8], ttl: Duration) -> Result<()> {
         let mut conn = self.conn_manager.clone();
 
-        let _: () = conn.set_ex(key, json_str, ttl.as_secs()).await?;
+        // Use pset_ex for millisecond precision
+        let ttl_millis = u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX);
+        let _: () = conn.pset_ex(key, value, ttl_millis).await?;
+
         self.sets.fetch_add(1, Ordering::Relaxed);
-        debug!(key = %key, ttl_secs = %ttl.as_secs(), "[Redis] Cached key with TTL");
+        debug!(key = %key, ttl_ms = %ttl_millis, "[Redis] Cached key with TTL");
         Ok(())
     }
 
@@ -206,23 +214,16 @@ impl CacheBackend for RedisCache {
 
     async fn health_check(&self) -> bool {
         let test_key = "health_check_redis";
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or(Duration::from_secs(0))
-            .as_secs();
-        let test_value = serde_json::json!({"test": true, "timestamp": timestamp});
+        let test_value = b"health_check_value".to_vec();
 
         match self
-            .set_with_ttl(test_key, test_value.clone(), Duration::from_secs(10))
+            .set_with_ttl(test_key, &test_value, Duration::from_secs(10))
             .await
         {
             Ok(()) => match self.get(test_key).await {
                 Some(retrieved) => {
                     let _ = self.remove(test_key).await;
-                    retrieved
-                        .get("test")
-                        .and_then(serde_json::Value::as_bool)
-                        .unwrap_or(false)
+                    retrieved == test_value
                 }
                 None => false,
             },
@@ -240,46 +241,49 @@ impl CacheBackend for RedisCache {
 /// This extends `CacheBackend` with TTL introspection capabilities needed for L2->L1 promotion.
 #[async_trait]
 impl L2CacheBackend for RedisCache {
-    async fn get_with_ttl(&self, key: &str) -> Option<(serde_json::Value, Option<Duration>)> {
+    async fn get_with_ttl(&self, key: &str) -> Option<(Vec<u8>, Option<Duration>)> {
         let mut conn = self.conn_manager.clone();
 
-        // Get value
-        let json_str: String = if let Ok(s) = conn.get(key).await {
-            s
+        // Use pipeline to get value and PTTL in a single round-trip
+        let result: (Option<Vec<u8>>, i64) = if let Ok(r) = redis::pipe()
+            .atomic()
+            .cmd("GET")
+            .arg(key)
+            .cmd("PTTL")
+            .arg(key)
+            .query_async(&mut conn)
+            .await
+        {
+            r
         } else {
             self.misses.fetch_add(1, Ordering::Relaxed);
             return None;
         };
 
-        // Parse JSON
-        let value: serde_json::Value = match serde_json::from_str(&json_str) {
-            Ok(v) => v,
-            Err(e) => {
-                warn!(
-                    key = %key,
-                    error = %e,
-                    "[Redis] Deserialization failed in get_with_ttl — returning None"
-                );
+        let (value_opt, pttl_ms) = result;
+
+        if let Some(value) = value_opt {
+            if value.is_empty() {
                 self.misses.fetch_add(1, Ordering::Relaxed);
                 return None;
             }
-        };
 
-        // Get TTL (in seconds, -1 = no expiry, -2 = key doesn't exist)
-        let ttl_secs: i64 = redis::cmd("TTL")
-            .arg(key)
-            .query_async(&mut conn)
-            .await
-            .unwrap_or(-1);
+            self.hits.fetch_add(1, Ordering::Relaxed);
 
-        self.hits.fetch_add(1, Ordering::Relaxed);
-
-        let ttl = if ttl_secs > 0 {
-            Some(Duration::from_secs(ttl_secs.unsigned_abs()))
+            // PTTL returns:
+            // -2 if the key does not exist
+            // -1 if the key exists but has no associated expire
+            // >= 0 is the remaining time in milliseconds
+            if pttl_ms > 0 {
+                #[allow(clippy::cast_sign_loss)]
+                let ttl_u64 = pttl_ms as u64;
+                Some((value, Some(Duration::from_millis(ttl_u64))))
+            } else {
+                Some((value, None))
+            }
         } else {
-            None // No expiry or error
-        };
-
-        Some((value, ttl))
+            self.misses.fetch_add(1, Ordering::Relaxed);
+            None
+        }
     }
 }

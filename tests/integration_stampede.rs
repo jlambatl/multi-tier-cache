@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used)]
+#![allow(clippy::expect_used)]
 //! Integration tests for stampede protection
 //!
 //! Tests concurrent access patterns and request coalescing
@@ -31,7 +33,7 @@ async fn test_concurrent_cache_miss() {
         tasks.spawn(async move {
             cache_clone
                 .cache_manager()
-                .get_or_compute_with(&key_clone, CacheStrategy::ShortTerm, || {
+                .get_or_compute(&key_clone, CacheStrategy::ShortTerm, || {
                     counter_clone.fetch_add(1, Ordering::SeqCst);
                     async move { Ok(test_data::json_user(1)) }
                 })
@@ -76,7 +78,7 @@ async fn test_concurrent_cache_hits() {
     // Pre-populate cache
     cache
         .cache_manager()
-        .set_with_strategy(&key, value.clone(), CacheStrategy::MediumTerm)
+        .set_with_strategy(&key, &value, CacheStrategy::MediumTerm)
         .await
         .unwrap_or_else(|_| panic!("Failed to set cache"));
 
@@ -125,7 +127,7 @@ async fn test_stampede_latency_reduction() {
     let start = std::time::Instant::now();
     let _ = cache
         .cache_manager()
-        .get_or_compute_with(&key, CacheStrategy::ShortTerm, || async {
+        .get_or_compute(&key, CacheStrategy::ShortTerm, || async {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             Ok(test_data::json_user(3))
         })
@@ -135,7 +137,7 @@ async fn test_stampede_latency_reduction() {
 
     // With cache: should be fast
     let start = std::time::Instant::now();
-    let _ = cache
+    let _: Option<serde_json::Value> = cache
         .cache_manager()
         .get(&key)
         .await

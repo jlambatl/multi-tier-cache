@@ -1,6 +1,7 @@
 //! Benchmarks for multi-tier cache operations (v0.5.0+)
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use std::hint::black_box;
 use multi_tier_cache::{CacheStrategy, CacheSystem, CacheSystemBuilder, L2Cache, TierConfig};
 use serde_json::json;
 use std::sync::Arc;
@@ -122,7 +123,7 @@ fn bench_multi_tier_write(c: &mut Criterion) {
                 let key = format!("bench:mt2:{}", rand::random::<u32>());
                 cache_2tier
                     .cache_manager()
-                    .set_with_strategy(&key, black_box(test_val.clone()), CacheStrategy::ShortTerm)
+                    .set_with_strategy(&key, &black_box(test_val.clone()), CacheStrategy::ShortTerm)
                     .await
                     .unwrap_or_else(|_| panic!("Failed to set cache"));
             });
@@ -138,7 +139,7 @@ fn bench_multi_tier_write(c: &mut Criterion) {
                 let key = format!("bench:mt3:{}", rand::random::<u32>());
                 cache_3tier
                     .cache_manager()
-                    .set_with_strategy(&key, black_box(test_val.clone()), CacheStrategy::ShortTerm)
+                    .set_with_strategy(&key, &black_box(test_val.clone()), CacheStrategy::ShortTerm)
                     .await
                     .unwrap_or_else(|_| panic!("Failed to set cache"));
             });
@@ -154,7 +155,7 @@ fn bench_multi_tier_write(c: &mut Criterion) {
                 let key = format!("bench:mt4:{}", rand::random::<u32>());
                 cache_4tier
                     .cache_manager()
-                    .set_with_strategy(&key, black_box(test_val.clone()), CacheStrategy::ShortTerm)
+                    .set_with_strategy(&key, &black_box(test_val.clone()), CacheStrategy::ShortTerm)
                     .await
                     .unwrap_or_else(|_| panic!("Failed to set cache"));
             });
@@ -200,7 +201,7 @@ fn bench_multi_tier_read(c: &mut Criterion) {
             let key = format!("bench:read:{i}");
             cache
                 .cache_manager()
-                .set_with_strategy(&key, test_data(1024), CacheStrategy::ShortTerm)
+                .set_with_strategy(&key, &test_data(1024), CacheStrategy::ShortTerm)
                 .await
                 .unwrap_or_else(|_| panic!("Failed to set cache"));
         }
@@ -213,7 +214,7 @@ fn bench_multi_tier_read(c: &mut Criterion) {
                 black_box(
                     cache
                         .cache_manager()
-                        .get(&key)
+                        .get::<serde_json::Value>(&key)
                         .await
                         .unwrap_or_else(|_| panic!("Failed to get cache")),
                 );
@@ -263,7 +264,7 @@ fn bench_ttl_scaling(c: &mut Criterion) {
                 let key = format!("bench:scale:no:{}", rand::random::<u32>());
                 cache_no_scale
                     .cache_manager()
-                    .set_with_strategy(&key, black_box(test_val.clone()), CacheStrategy::ShortTerm)
+                    .set_with_strategy(&key, &black_box(test_val.clone()), CacheStrategy::ShortTerm)
                     .await
                     .unwrap_or_else(|_| panic!("Failed to set cache"));
             });
@@ -309,7 +310,7 @@ fn bench_ttl_scaling(c: &mut Criterion) {
                 let key = format!("bench:scale:yes:{}", rand::random::<u32>());
                 cache_with_scale
                     .cache_manager()
-                    .set_with_strategy(&key, black_box(test_val.clone()), CacheStrategy::ShortTerm)
+                    .set_with_strategy(&key, &black_box(test_val.clone()), CacheStrategy::ShortTerm)
                     .await
                     .unwrap_or_else(|_| panic!("Failed to set cache"));
             });
@@ -361,14 +362,14 @@ fn bench_data_size_multi_tier(c: &mut Criterion) {
                     let key = format!("bench:size:{}", rand::random::<u32>());
                     cache
                         .cache_manager()
-                        .set_with_strategy(&key, black_box(data.clone()), CacheStrategy::ShortTerm)
+                        .set_with_strategy(&key, &black_box(data.clone()), CacheStrategy::ShortTerm)
                         .await
                         .unwrap_or_else(|_| panic!("Failed to set cache"));
 
                     black_box(
                         cache
                             .cache_manager()
-                            .get(&key)
+                            .get::<serde_json::Value>(&key)
                             .await
                             .unwrap_or_else(|_| panic!("Failed to get cache")),
                     );
@@ -416,7 +417,7 @@ fn bench_tier_stats(c: &mut Criterion) {
             let key = format!("bench:stats:{i}");
             cache
                 .cache_manager()
-                .set_with_strategy(&key, test_data(1024), CacheStrategy::ShortTerm)
+                .set_with_strategy(&key, &test_data(1024), CacheStrategy::ShortTerm)
                 .await
                 .unwrap_or_else(|_| panic!("Failed to set cache"));
         }
@@ -424,7 +425,7 @@ fn bench_tier_stats(c: &mut Criterion) {
 
     c.bench_function("tier_stats_access", |b| {
         b.iter(|| {
-            let stats = cache.cache_manager().get_tier_stats();
+            let stats = cache.cache_manager().get_stats().tiers;
             black_box(stats);
         });
     });

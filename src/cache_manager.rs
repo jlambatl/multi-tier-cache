@@ -4,32 +4,29 @@
 
 use anyhow::Result;
 use dashmap::DashMap;
-use serde_json;
+use serde::de::DeserializeOwned;
+use serde::Serialize;
 use std::future::Future;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
-
-use tracing::{debug, error, info, warn};
 
 use super::invalidation::{
     AtomicInvalidationStats, InvalidationConfig, InvalidationMessage, InvalidationPublisher,
     InvalidationStats, InvalidationSubscriber,
 };
 use crate::backends::{L1Cache, L2Cache};
-use crate::traits::{CacheBackend, L2CacheBackend, StreamingBackend};
+use crate::codecs::JsonCodec;
+use crate::traits::{CacheBackend, CacheCodec, L2CacheBackend, StreamingBackend};
 
 /// Type alias for the in-flight requests map.
-///
-/// Uses `Arc<str>` instead of `String` to reduce per-request allocation overhead.
-/// When a cache key misses L1 and enters stampede protection, only one `Arc<str>`
-/// is allocated and then cheaply cloned (atomic refcount bump) for the `DashMap`
-/// entry and the `CleanupGuard`.
 type InFlightMap = DashMap<Arc<str>, Arc<Mutex<()>>>;
 
-/// RAII cleanup guard for in-flight request tracking
-/// Ensures that entries are removed from `DashMap` even on early return or panic
+/// RAII cleanup guard for in-flight request tracking.
+///
+/// Ensures that the request lock is removed from the `InFlightMap` when the guard goes out of scope,
+/// preventing stale locks even if the thread panics or returns early.
 struct CleanupGuard<'a> {
     map: &'a InFlightMap,
     key: Arc<str>,
@@ -41,33 +38,25 @@ impl Drop for CleanupGuard<'_> {
     }
 }
 
-/// Cache strategies for different data types
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
+/// Cache strategies
+#[derive(Debug, Clone, Copy)]
 pub enum CacheStrategy {
-    /// Real-time data - 10 seconds TTL
     RealTime,
-    /// Short-term data - 5 minutes TTL  
     ShortTerm,
-    /// Medium-term data - 1 hour TTL
     MediumTerm,
-    /// Long-term data - 3 hours TTL
     LongTerm,
-    /// Custom TTL
     Custom(Duration),
-    /// Default strategy (5 minutes)
     Default,
 }
 
 impl CacheStrategy {
-    /// Convert strategy to duration
     #[must_use]
     pub fn to_duration(&self) -> Duration {
         match self {
             Self::RealTime => Duration::from_secs(10),
-            Self::ShortTerm | Self::Default => Duration::from_secs(300), // 5 minutes
-            Self::MediumTerm => Duration::from_secs(3600),               // 1 hour
-            Self::LongTerm => Duration::from_secs(10800),                // 3 hours
+            Self::ShortTerm | Self::Default => Duration::from_secs(300),
+            Self::MediumTerm => Duration::from_secs(3600),
+            Self::LongTerm => Duration::from_secs(10800),
             Self::Custom(duration) => *duration,
         }
     }
@@ -76,11 +65,8 @@ impl CacheStrategy {
 /// Statistics for a single cache tier
 #[derive(Debug)]
 pub struct TierStats {
-    /// Tier level (1 = L1, 2 = L2, 3 = L3, etc.)
     pub tier_level: usize,
-    /// Number of cache hits at this tier
     pub hits: AtomicU64,
-    /// Backend name for identification
     pub backend_name: String,
 }
 
@@ -109,22 +95,16 @@ impl TierStats {
     }
 }
 
-/// A single cache tier in the multi-tier architecture
+/// A single cache tier
 pub struct CacheTier {
-    /// Cache backend for this tier
     backend: Arc<dyn L2CacheBackend>,
-    /// Tier level (1 = hottest/fastest, higher = colder/slower)
     tier_level: usize,
-    /// Enable automatic promotion to upper tiers on cache hit
     promotion_enabled: bool,
-    /// TTL scale factor (multiplier for TTL when storing/promoting)
     ttl_scale: f64,
-    /// Statistics for this tier
     stats: TierStats,
 }
 
 impl CacheTier {
-    /// Create a new cache tier
     pub fn new(
         backend: Arc<dyn L2CacheBackend>,
         tier_level: usize,
@@ -141,42 +121,29 @@ impl CacheTier {
         }
     }
 
-    /// Get value with TTL from this tier
-    async fn get_with_ttl(&self, key: &str) -> Option<(serde_json::Value, Option<Duration>)> {
+    async fn get_with_ttl(&self, key: &str) -> Option<(Vec<u8>, Option<Duration>)> {
         self.backend.get_with_ttl(key).await
     }
 
-    /// Set value with TTL in this tier
-    async fn set_with_ttl(&self, key: &str, value: serde_json::Value, ttl: Duration) -> Result<()> {
+    async fn set_with_ttl(&self, key: &str, value: &[u8], ttl: Duration) -> Result<()> {
         let scaled_ttl = Duration::from_secs_f64(ttl.as_secs_f64() * self.ttl_scale);
         self.backend.set_with_ttl(key, value, scaled_ttl).await
     }
 
-    /// Remove value from this tier
-    async fn remove(&self, key: &str) -> Result<()> {
-        self.backend.remove(key).await
-    }
-
-    /// Record a cache hit for this tier
     fn record_hit(&self) {
         self.stats.hits.fetch_add(1, Ordering::Relaxed);
     }
 }
 
-/// Configuration for a cache tier (used in builder pattern)
+/// Configuration for a cache tier
 #[derive(Debug, Clone)]
 pub struct TierConfig {
-    /// Tier level (1, 2, 3, 4...)
     pub tier_level: usize,
-    /// Enable promotion to upper tiers on hit
     pub promotion_enabled: bool,
-    /// TTL scale factor (1.0 = same as base TTL)
     pub ttl_scale: f64,
 }
 
 impl TierConfig {
-    /// Create new tier configuration
-    #[must_use]
     pub fn new(tier_level: usize) -> Self {
         Self {
             tier_level,
@@ -186,17 +153,15 @@ impl TierConfig {
     }
 
     /// Configure as L1 (hot tier)
-    #[must_use]
     pub fn as_l1() -> Self {
         Self {
             tier_level: 1,
-            promotion_enabled: false, // L1 is already top tier
+            promotion_enabled: false,
             ttl_scale: 1.0,
         }
     }
 
     /// Configure as L2 (warm tier)
-    #[must_use]
     pub fn as_l2() -> Self {
         Self {
             tier_level: 2,
@@ -205,23 +170,21 @@ impl TierConfig {
         }
     }
 
-    /// Configure as L3 (cold tier) with longer TTL
-    #[must_use]
+    /// Configure as L3 (cold tier)
     pub fn as_l3() -> Self {
         Self {
             tier_level: 3,
             promotion_enabled: true,
-            ttl_scale: 2.0, // Keep data 2x longer
+            ttl_scale: 2.0,
         }
     }
 
-    /// Configure as L4 (archive tier) with much longer TTL
-    #[must_use]
+    /// Configure as L4 (archive tier)
     pub fn as_l4() -> Self {
         Self {
             tier_level: 4,
             promotion_enabled: true,
-            ttl_scale: 8.0, // Keep data 8x longer
+            ttl_scale: 8.0,
         }
     }
 
@@ -247,19 +210,18 @@ impl TierConfig {
     }
 }
 
-/// Proxy wrapper to convert `L2CacheBackend` to `CacheBackend`
-/// (Rust doesn't support automatic trait upcasting for trait objects)
+/// Proxy wrapper
 struct ProxyCacheBackend {
     backend: Arc<dyn L2CacheBackend>,
 }
 
 #[async_trait::async_trait]
 impl CacheBackend for ProxyCacheBackend {
-    async fn get(&self, key: &str) -> Option<serde_json::Value> {
+    async fn get(&self, key: &str) -> Option<Vec<u8>> {
         self.backend.get(key).await
     }
 
-    async fn set_with_ttl(&self, key: &str, value: serde_json::Value, ttl: Duration) -> Result<()> {
+    async fn set_with_ttl(&self, key: &str, value: &[u8], ttl: Duration) -> Result<()> {
         self.backend.set_with_ttl(key, value, ttl).await
     }
 
@@ -274,1216 +236,669 @@ impl CacheBackend for ProxyCacheBackend {
     fn name(&self) -> &'static str {
         self.backend.name()
     }
+
+    async fn remove_pattern(&self, pattern: &str) -> Result<()> {
+        self.backend.remove_pattern(pattern).await
+    }
 }
 
-/// Cache Manager - Unified operations across multiple cache tiers
-///
-/// Supports both legacy 2-tier (L1+L2) and new multi-tier (L1+L2+L3+L4+...) architectures.
-/// When `tiers` is Some, it uses the dynamic multi-tier system. Otherwise, falls back to
-/// legacy L1+L2 behavior for backward compatibility.
-pub struct CacheManager {
-    /// Dynamic multi-tier cache architecture (v0.5.0+)
-    /// If Some, this takes precedence over `l1_cache/l2_cache` fields
+/// Inner state
+pub struct CacheManagerInner<C: CacheCodec = JsonCodec> {
     tiers: Option<Vec<CacheTier>>,
-
-    // ===== Legacy fields (v0.1.0 - v0.4.x) =====
-    // Maintained for backward compatibility
-    /// L1 Cache (trait object for pluggable backends)
     l1_cache: Arc<dyn CacheBackend>,
-    /// L2 Cache (trait object for pluggable backends)
     l2_cache: Arc<dyn L2CacheBackend>,
-    /// L2 Cache concrete instance (for invalidation `scan_keys`)
     l2_cache_concrete: Option<Arc<L2Cache>>,
-
-    /// Optional streaming backend (defaults to L2 if it implements `StreamingBackend`)
     streaming_backend: Option<Arc<dyn StreamingBackend>>,
-    /// Statistics (`AtomicU64` is already thread-safe, no Arc needed)
+    codec: Arc<C>,
     total_requests: AtomicU64,
     l1_hits: AtomicU64,
     l2_hits: AtomicU64,
     misses: AtomicU64,
-    promotions: AtomicUsize,
-    /// In-flight requests to prevent Cache Stampede on L2/compute operations
-    in_flight_requests: Arc<InFlightMap>,
-    /// Invalidation publisher (for broadcasting invalidation messages)
-    invalidation_publisher: Option<Arc<Mutex<InvalidationPublisher>>>,
-    /// Invalidation subscriber (for receiving invalidation messages)
-    invalidation_subscriber: Option<Arc<InvalidationSubscriber>>,
-    /// Invalidation statistics
+    promotions: AtomicU64,
+    in_flight_requests: InFlightMap,
+    invalidation_publisher: Option<Mutex<InvalidationPublisher>>,
+    invalidation_subscriber: Option<InvalidationSubscriber>,
     invalidation_stats: Arc<AtomicInvalidationStats>,
 }
 
-impl CacheManager {
-    /// Create new cache manager with trait objects (pluggable backends)
+/// Unified Cache Manager for L1/L2 and Multi-Tier operations
+///
+/// The `CacheManager` orchestrates all cache interactions, providing:
+/// - **Multi-Tier Logic**: Intelligently queries L1 -> L2 -> ... -> Back and promotes hot items.
+/// - **Cache Stampede Protection**: Uses `DashMap` + Mutex to coalesce identical requests for the same key.
+/// - **Serialization**: Handles typed `T` <-> `bytes` conversion via pluggable `CacheCodec`.
+/// - **Invalidation**: Publishes invalidation events if configured.
+/// - **Stats**: Tracks hits, misses, promotions, and in-flight requests.
+///
+/// # Type Parameters
+/// * `C`: The serialization codec (defaults to `JsonCodec`).
+#[derive(Clone)]
+pub struct CacheManager<C: CacheCodec = JsonCodec> {
+    inner: Arc<CacheManagerInner<C>>,
+}
+
+impl<C: CacheCodec> CacheManager<C> {
+    /// Get current cache statistics
     ///
-    /// This is the primary constructor for v0.3.0+, supporting custom cache backends.
+    /// Returns a snapshot of performance metrics including hit rates and request counts.
+    pub fn get_stats(&self) -> CacheManagerStats {
+        let stats = CacheManagerStats {
+            total_requests: self.inner.total_requests.load(Ordering::Relaxed),
+            l1_hits: self.inner.l1_hits.load(Ordering::Relaxed),
+            l2_hits: self.inner.l2_hits.load(Ordering::Relaxed),
+            misses: self.inner.misses.load(Ordering::Relaxed),
+            promotions: self.inner.promotions.load(Ordering::Relaxed),
+            in_flight_requests: self.inner.in_flight_requests.len(),
+            hit_rate: 0.0,
+            l1_hit_rate: 0.0,
+            l2_hit_rate: 0.0,
+            invalidation_stats: self.inner.invalidation_stats.snapshot(),
+            tiers: self
+                .inner
+                .tiers
+                .as_ref()
+                .map(|tiers| tiers.iter().map(|t| t.stats.clone()).collect()),
+        };
+        stats.calculate_hit_rates()
+    }
+
+    /// Create a new `CacheManager` with a custom codec.
     ///
     /// # Arguments
     ///
-    /// * `l1_cache` - Any L1 cache backend implementing `CacheBackend` trait
-    /// * `l2_cache` - Any L2 cache backend implementing `L2CacheBackend` trait
-    /// * `streaming_backend` - Optional streaming backend (None to disable streaming)
+    /// * `l1_cache` - The L1 (in-memory) cache backend.
+    /// * `l2_cache` - The L2 (distributed) cache backend.
+    /// * `streaming_backend` - Optional backend for event streams (e.g. Redis Streams).
+    /// * `codec` - The serialization implementation (e.g., `JsonCodec`, `PostcardCodec`).
     ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// use multi_tier_cache::{CacheManager, L1Cache, L2Cache};
-    /// use std::sync::Arc;
-    ///
-    /// let l1: Arc<dyn CacheBackend> = Arc::new(L1Cache::new().await?);
-    /// let l2: Arc<dyn L2CacheBackend> = Arc::new(L2Cache::new().await?);
-    ///
-    /// let manager = CacheManager::new_with_backends(l1, l2, None).await?;
-    /// ```
     /// # Errors
     ///
-    /// Returns `Ok` if successful. Currently no error conditions, but kept for future compatibility.
-    pub fn new_with_backends(
+    /// Returns `Ok(Self)` on success. No I/O is performed during construction.
+    pub fn with_codec(
         l1_cache: Arc<dyn CacheBackend>,
         l2_cache: Arc<dyn L2CacheBackend>,
         streaming_backend: Option<Arc<dyn StreamingBackend>>,
+        codec: C,
     ) -> Result<Self> {
-        debug!("Initializing Cache Manager with custom backends...");
-        debug!("  L1: {}", l1_cache.name());
-        debug!("  L2: {}", l2_cache.name());
-        if streaming_backend.is_some() {
-            debug!("  Streaming: enabled");
-        } else {
-            debug!("  Streaming: disabled");
-        }
-
         Ok(Self {
-            tiers: None, // Legacy mode: use l1_cache/l2_cache fields
-            l1_cache,
-            l2_cache,
-            l2_cache_concrete: None,
-            streaming_backend,
-            total_requests: AtomicU64::new(0),
-            l1_hits: AtomicU64::new(0),
-            l2_hits: AtomicU64::new(0),
-            misses: AtomicU64::new(0),
-            promotions: AtomicUsize::new(0),
-            in_flight_requests: Arc::new(DashMap::new()),
-            invalidation_publisher: None,
-            invalidation_subscriber: None,
-            invalidation_stats: Arc::new(AtomicInvalidationStats::default()),
+            inner: Arc::new(CacheManagerInner {
+                tiers: None,
+                l1_cache,
+                l2_cache,
+                l2_cache_concrete: None,
+                streaming_backend,
+                codec: Arc::new(codec),
+                total_requests: AtomicU64::new(0),
+                l1_hits: AtomicU64::new(0),
+                l2_hits: AtomicU64::new(0),
+                misses: AtomicU64::new(0),
+                promotions: AtomicU64::new(0),
+                in_flight_requests: DashMap::new(),
+                invalidation_publisher: None,
+                invalidation_subscriber: None,
+                invalidation_stats: Arc::new(AtomicInvalidationStats::default()),
+            }),
         })
     }
 
-    /// Create new cache manager with default backends (backward compatible)
+    /// Create a new `CacheManager` with multiple tiers and a custom codec.
     ///
-    /// This is the legacy constructor maintained for backward compatibility.
-    /// New code should prefer `new_with_backends()` or `CacheSystemBuilder`.
-    ///
-    /// # Arguments
-    ///
-    /// * `l1_cache` - Moka L1 cache instance
-    /// * `l2_cache` - Redis L2 cache instance
-    /// # Errors
-    ///
-    /// Returns an error if Redis connection fails.
-    pub async fn new(l1_cache: Arc<L1Cache>, l2_cache: Arc<L2Cache>) -> Result<Self> {
-        debug!("Initializing Cache Manager...");
-
-        // Convert concrete types to trait objects
-        let l1_backend: Arc<dyn CacheBackend> = l1_cache.clone();
-        let l2_backend: Arc<dyn L2CacheBackend> = l2_cache.clone();
-
-        // Create RedisStreams backend for streaming functionality
-        let redis_url =
-            std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
-        let redis_streams = crate::redis_streams::RedisStreams::new(&redis_url).await?;
-        let streaming_backend: Arc<dyn StreamingBackend> = Arc::new(redis_streams);
-
-        Self::new_with_backends(l1_backend, l2_backend, Some(streaming_backend))
-    }
-
-    /// Create new cache manager with invalidation support
-    ///
-    /// This constructor enables cross-instance cache invalidation via Redis Pub/Sub.
+    /// This constructor allows for N-tier architectures (e.g., L1 -> L2 -> L3) with
+    /// intelligent promotion and fallback strategies.
     ///
     /// # Arguments
     ///
-    /// * `l1_cache` - Moka L1 cache instance
-    /// * `l2_cache` - Redis L2 cache instance
-    /// * `redis_url` - Redis connection URL for Pub/Sub
-    /// * `config` - Invalidation configuration
+    /// * `tiers` - Vector of configured `CacheTier` structs.
+    /// * `streaming_backend` - Optional streaming backend.
+    /// * `codec` - The serialization implementation.
     ///
-    /// # Example
+    /// # Validation
     ///
-    /// ```rust,ignore
-    /// use multi_tier_cache::{CacheManager, L1Cache, L2Cache, InvalidationConfig};
+    /// The `tiers` MUST be sorted by `tier_level` in ascending order (L1, L2, L3...).
+    /// If an out-of-order tier is detected (e.g., L3 before L2), this function will return an error.
     ///
-    /// let config = InvalidationConfig {
-    ///     channel: "my_app:cache:invalidate".to_string(),
-    ///     ..Default::default()
-    /// };
-    ///
-    /// let manager = CacheManager::new_with_invalidation(
-    ///     l1, l2, "redis://localhost", config
-    /// ).await?;
-    /// ```
     /// # Errors
     ///
-    /// Returns an error if Redis connection fails or invalidation setup fails.
-    pub async fn new_with_invalidation(
-        l1_cache: Arc<L1Cache>,
-        l2_cache: Arc<L2Cache>,
-        redis_url: &str,
-        config: InvalidationConfig,
-    ) -> Result<Self> {
-        debug!("Initializing Cache Manager with Invalidation...");
-        debug!("  Pub/Sub channel: {}", config.channel);
-
-        // Convert concrete types to trait objects
-        let l1_backend: Arc<dyn CacheBackend> = l1_cache.clone();
-        let l2_backend: Arc<dyn L2CacheBackend> = l2_cache.clone();
-
-        // Create RedisStreams backend for streaming functionality
-        let redis_streams = crate::redis_streams::RedisStreams::new(redis_url).await?;
-        let streaming_backend: Arc<dyn StreamingBackend> = Arc::new(redis_streams);
-
-        // Create publisher
-        let client = redis::Client::open(redis_url)?;
-        let conn_manager = redis::aio::ConnectionManager::new(client).await?;
-        let publisher = InvalidationPublisher::new(conn_manager, config.clone());
-
-        // Create subscriber
-        let subscriber = InvalidationSubscriber::new(redis_url, config.clone())?;
-        let invalidation_stats = Arc::new(AtomicInvalidationStats::default());
-
-        let manager = Self {
-            tiers: None, // Legacy mode: use l1_cache/l2_cache fields
-            l1_cache: l1_backend,
-            l2_cache: l2_backend,
-            l2_cache_concrete: Some(l2_cache),
-            streaming_backend: Some(streaming_backend),
-            total_requests: AtomicU64::new(0),
-            l1_hits: AtomicU64::new(0),
-            l2_hits: AtomicU64::new(0),
-            misses: AtomicU64::new(0),
-            promotions: AtomicUsize::new(0),
-            in_flight_requests: Arc::new(DashMap::new()),
-            invalidation_publisher: Some(Arc::new(Mutex::new(publisher))),
-            invalidation_subscriber: Some(Arc::new(subscriber)),
-            invalidation_stats,
-        };
-
-        // Start subscriber with handler
-        manager.start_invalidation_subscriber();
-
-        info!("Cache Manager initialized with invalidation support");
-
-        Ok(manager)
-    }
-
-    /// Create new cache manager with multi-tier architecture (v0.5.0+)
-    ///
-    /// This constructor enables dynamic multi-tier caching with 3, 4, or more tiers.
-    /// Tiers are checked in order (lower `tier_level` = faster/hotter).
-    ///
-    /// # Arguments
-    ///
-    /// * `tiers` - Vector of configured cache tiers (must be sorted by `tier_level` ascending)
-    /// * `streaming_backend` - Optional streaming backend
-    ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// use multi_tier_cache::{CacheManager, CacheTier, TierConfig, L1Cache, L2Cache};
-    /// use std::sync::Arc;
-    ///
-    /// // L1 + L2 + L3 setup
-    /// let l1 = Arc::new(L1Cache::new()?);
-    /// let l2 = Arc::new(L2Cache::new().await?);
-    /// let l3 = Arc::new(RocksDBCache::new("/tmp/cache").await?);
-    ///
-    /// let tiers = vec![
-    ///     CacheTier::new(l1, 1, false, 1.0),  // L1 - no promotion
-    ///     CacheTier::new(l2, 2, true, 1.0),   // L2 - promote to L1
-    ///     CacheTier::new(l3, 3, true, 2.0),   // L3 - promote to L2&L1, 2x TTL
-    /// ];
-    ///
-    /// let manager = CacheManager::new_with_tiers(tiers, None).await?;
-    /// ```
-    /// # Errors
-    ///
-    /// Returns an error if tiers are not sorted by level or if no tiers are provided.
-    pub fn new_with_tiers(
+    /// Returns `Err` if `tiers` are not strictly ascending by `tier_level`.
+    pub fn with_tiers_and_codec(
         tiers: Vec<CacheTier>,
         streaming_backend: Option<Arc<dyn StreamingBackend>>,
+        codec: C,
     ) -> Result<Self> {
-        debug!("Initializing Multi-Tier Cache Manager...");
-        debug!("  Tier count: {}", tiers.len());
-        for tier in &tiers {
-            debug!(
-                "  L{}: {} (promotion={}, ttl_scale={})",
-                tier.tier_level, tier.stats.backend_name, tier.promotion_enabled, tier.ttl_scale
-            );
+        // Validation: At least one tier is required
+        if tiers.is_empty() {
+            anyhow::bail!("At least one cache tier is required");
         }
 
-        // Validate tiers are sorted by level
-        for i in 1..tiers.len() {
-            if let (Some(current), Some(prev)) = (tiers.get(i), tiers.get(i - 1)) {
-                if current.tier_level <= prev.tier_level {
+        // Validation: Tiers must be sorted by tier_level
+        for w in tiers.windows(2) {
+            if let [prev, curr] = w {
+                if curr.tier_level <= prev.tier_level {
                     anyhow::bail!(
-                        "Tiers must be sorted by tier_level ascending (found L{} after L{})",
-                        current.tier_level,
+                        "Tiers must be strictly ascending by level (found L{} after L{})",
+                        curr.tier_level,
                         prev.tier_level
                     );
                 }
             }
         }
 
-        // For backward compatibility with legacy code, we need dummy l1/l2 caches
-        // Use first tier as l1, second tier as l2 if available
-        let (l1_cache, l2_cache) = if tiers.len() >= 2 {
-            if let (Some(t0), Some(t1)) = (tiers.first(), tiers.get(1)) {
-                (t0.backend.clone(), t1.backend.clone())
-            } else {
-                // Should be unreachable due to len check
-                anyhow::bail!("Failed to access tiers 0 and 1");
-            }
-        } else if tiers.len() == 1 {
-            // Only one tier - use it for both
-            if let Some(t0) = tiers.first() {
-                let tier = t0.backend.clone();
-                (tier.clone(), tier)
-            } else {
-                anyhow::bail!("Failed to access tier 0");
-            }
-        } else {
-            anyhow::bail!("At least one cache tier is required");
-        };
+        let l1_cache = tiers
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("No tiers provided"))?
+            .backend
+            .clone();
 
-        // Convert to CacheBackend trait for l1 (L2CacheBackend extends CacheBackend)
+        let l2_cache = tiers
+            .get(1)
+            .map(|t| t.backend.clone())
+            .unwrap_or(l1_cache.clone());
+
         let l1_backend: Arc<dyn CacheBackend> = Arc::new(ProxyCacheBackend {
             backend: l1_cache.clone(),
         });
 
         Ok(Self {
-            tiers: Some(tiers),
-            l1_cache: l1_backend,
-            l2_cache,
-            l2_cache_concrete: None,
-            streaming_backend,
-            total_requests: AtomicU64::new(0),
-            l1_hits: AtomicU64::new(0),
-            l2_hits: AtomicU64::new(0),
-            misses: AtomicU64::new(0),
-            promotions: AtomicUsize::new(0),
-            in_flight_requests: Arc::new(DashMap::new()),
-            invalidation_publisher: None,
-            invalidation_subscriber: None,
-            invalidation_stats: Arc::new(AtomicInvalidationStats::default()),
+            inner: Arc::new(CacheManagerInner {
+                tiers: Some(tiers),
+                l1_cache: l1_backend,
+                l2_cache,
+                l2_cache_concrete: None,
+                streaming_backend,
+                codec: Arc::new(codec),
+                total_requests: AtomicU64::new(0),
+                l1_hits: AtomicU64::new(0),
+                l2_hits: AtomicU64::new(0),
+                misses: AtomicU64::new(0),
+                promotions: AtomicU64::new(0),
+                in_flight_requests: DashMap::new(),
+                invalidation_publisher: None,
+                invalidation_subscriber: None,
+                invalidation_stats: Arc::new(AtomicInvalidationStats::default()),
+            }),
         })
     }
 
-    /// Start the invalidation subscriber background task
-    fn start_invalidation_subscriber(&self) {
-        if let Some(subscriber) = &self.invalidation_subscriber {
-            let l1_cache = Arc::clone(&self.l1_cache);
-            let l2_cache_concrete = self.l2_cache_concrete.clone();
-
-            subscriber.start(move |msg| {
-                let l1 = Arc::clone(&l1_cache);
-                let _l2 = l2_cache_concrete.clone();
-
-                async move {
-                    match msg {
-                        InvalidationMessage::Remove { key } => {
-                            // Remove from L1
-                            l1.remove(&key).await?;
-                            debug!("Invalidation: Removed '{}' from L1", key);
-                        }
-                        InvalidationMessage::Update {
-                            key,
-                            value,
-                            ttl_secs,
-                        } => {
-                            // Update L1 with new value
-                            let ttl = ttl_secs
-                                .map_or_else(|| Duration::from_secs(300), Duration::from_secs);
-                            l1.set_with_ttl(&key, value, ttl).await?;
-                            debug!("Invalidation: Updated '{}' in L1", key);
-                        }
-                        InvalidationMessage::RemovePattern { pattern } => {
-                            // Remove matching keys from L1
-                            if let Err(e) = l1.remove_pattern(&pattern).await {
-                                warn!("Failed to remove pattern '{}' from L1: {}", pattern, e);
-                            }
-                            debug!("Invalidation: Pattern '{}' removed from L1", pattern);
-                        }
-                        InvalidationMessage::RemoveBulk { keys } => {
-                            // Remove multiple keys from L1
-                            for key in keys {
-                                if let Err(e) = l1.remove(&key).await {
-                                    warn!("Failed to remove '{}' from L1: {}", key, e);
-                                }
-                            }
-                            debug!("Invalidation: Bulk removed keys from L1");
-                        }
-                    }
-                    Ok(())
-                }
-            });
-
-            info!("Invalidation subscriber started");
-        }
-    }
-
-    /// Get value from cache using multi-tier architecture (v0.5.0+)
+    /// Retrieve a value from the cache (Tiered L1 -> L2 -> ... -> L(n))
     ///
-    /// This method iterates through all configured tiers and automatically promotes
-    /// to upper tiers on cache hit.
-    async fn get_multi_tier(&self, key: &str) -> Result<Option<serde_json::Value>> {
-        let Some(tiers) = self.tiers.as_ref() else {
-            panic!("Tiers must be initialized in multi-tier mode")
-        }; // Safe: only called when tiers is Some
-
-        // Try each tier sequentially (sorted by tier_level)
-        for (tier_index, tier) in tiers.iter().enumerate() {
-            if let Some((value, ttl)) = tier.get_with_ttl(key).await {
-                // Cache hit!
-                tier.record_hit();
-
-                // Promote to all upper tiers (if promotion enabled)
-                if tier.promotion_enabled && tier_index > 0 {
-                    let promotion_ttl = ttl.unwrap_or_else(|| CacheStrategy::Default.to_duration());
-
-                    // Promote to all tiers above this one
-                    for upper_tier in tiers.iter().take(tier_index).rev() {
-                        if let Err(e) = upper_tier
-                            .set_with_ttl(key, value.clone(), promotion_ttl)
-                            .await
-                        {
-                            warn!(
-                                "Failed to promote '{}' from L{} to L{}: {}",
-                                key, tier.tier_level, upper_tier.tier_level, e
-                            );
-                        } else {
-                            self.promotions.fetch_add(1, Ordering::Relaxed);
-                            debug!(
-                                "Promoted '{}' from L{} to L{} (TTL: {:?})",
-                                key, tier.tier_level, upper_tier.tier_level, promotion_ttl
-                            );
-                        }
-                    }
-                }
-
-                return Ok(Some(value));
-            }
-        }
-
-        // Cache miss across all tiers
-        Ok(None)
-    }
-
-    /// Get value from cache (L1 first, then L2 fallback with promotion)
-    ///
-    /// This method now includes built-in Cache Stampede protection when cache misses occur.
-    /// Multiple concurrent requests for the same missing key will be coalesced to prevent
-    /// unnecessary duplicate work on external data sources.
-    ///
-    /// Supports both legacy 2-tier mode and new multi-tier mode (v0.5.0+).
+    /// # The Flow (Optimized Read)
+    /// 1. **L1 Check**: Quickly check L1 (in-memory).
+    /// 2. **Stampede Protection**: If missing in L1, check if an in-flight request exists.
+    ///    - If yes & `allow_wait` is true: Wait for it, then check L1 again.
+    ///    - If no: Proceed to L2.
+    /// 3. **L2+ Query**: If missing, check L2 (and subsequent tiers).
+    /// 4. **Promotion**: If found in L2+, promote to L1.
     ///
     /// # Arguments
-    /// * `key` - Cache key to retrieve
+    ///
+    /// * `key` - The cache key to retrieve.
     ///
     /// # Returns
-    /// * `Ok(Some(value))` - Cache hit, value found in any tier
-    /// * `Ok(None)` - Cache miss, value not found in any cache
-    /// * `Err(error)` - Cache operation failed
-    /// # Errors
     ///
-    /// Returns an error if cache operation fails.
-    ///
-    /// # Panics
-    ///
-    /// Panics if tiers are not initialized in multi-tier mode (should not happen if constructed correctly).
-    pub async fn get(&self, key: &str) -> Result<Option<serde_json::Value>> {
-        self.total_requests.fetch_add(1, Ordering::Relaxed);
+    /// * `Ok(Some(T))` - The deserialized value found in cache.
+    /// * `Ok(None)` - The value was not found in any tier.
+    /// * `Err(e)` - Serialization or IO error.
+    pub async fn get<T: DeserializeOwned>(&self, key: &str) -> Result<Option<T>> {
+        self.get_internal(key, true).await
+    }
 
-        // NEW: Multi-tier mode (v0.5.0+)
-        if self.tiers.is_some() {
-            // Fast path for L1 (first tier) - no locking needed
-            if let Some(tier1) = self
-                .tiers
-                .as_ref()
-                .unwrap_or_else(|| panic!("Tiers initialized"))
-                .first()
-            {
-                if let Some((value, _ttl)) = tier1.get_with_ttl(key).await {
-                    tier1.record_hit();
-                    // Update legacy stats for backward compatibility
-                    self.l1_hits.fetch_add(1, Ordering::Relaxed);
-                    return Ok(Some(value));
+    async fn get_multi_tier<T: DeserializeOwned>(
+        &self,
+        tiers: &[CacheTier],
+        key: &str,
+        allow_wait: bool,
+    ) -> Result<Option<T>> {
+        for (idx, tier) in tiers.iter().enumerate() {
+            // Tier fetch logic
+            let check_tier_fn = || async {
+                if let Some((value, ttl)) = tier.get_with_ttl(key).await {
+                    match self.inner.codec.deserialize(&value) {
+                        Ok(v) => Some((v, value, ttl)),
+                        Err(e) => {
+                            tracing::warn!(
+                                "Cache deserialization failed for key '{}' in L{}: {}",
+                                key,
+                                tier.tier_level,
+                                e
+                            );
+                            None
+                        }
+                    }
+                } else {
+                    None
                 }
-            }
-
-            // L1 miss - use stampede protection for lower tiers
-            let key_arc: Arc<str> = Arc::from(key);
-            let lock_guard = self
-                .in_flight_requests
-                .entry(Arc::clone(&key_arc))
-                .or_insert_with(|| Arc::new(Mutex::new(())))
-                .clone();
-
-            let _guard = lock_guard.lock().await;
-            let cleanup_guard = CleanupGuard {
-                map: &self.in_flight_requests,
-                key: Arc::clone(&key_arc),
             };
 
-            // Double-check L1 after acquiring lock
-            if let Some(tier1) = self
-                .tiers
-                .as_ref()
-                .unwrap_or_else(|| panic!("Tiers initialized"))
-                .first()
-            {
-                if let Some((value, _ttl)) = tier1.get_with_ttl(key).await {
-                    tier1.record_hit();
-                    self.l1_hits.fetch_add(1, Ordering::Relaxed);
-                    return Ok(Some(value));
+            let mut result = check_tier_fn().await;
+
+            // Hit on L1?
+            if result.is_some() && idx == 0 {
+                self.inner.l1_hits.fetch_add(1, Ordering::Relaxed);
+                tier.record_hit();
+                return Ok(result.map(|(v, _, _)| v));
+            }
+
+            // If this is L1 and we missed, check for stampede
+            if result.is_none() && idx == 0 && allow_wait {
+                let opt_mutex = self
+                    .inner
+                    .in_flight_requests
+                    .get(key)
+                    .map(|r| r.value().clone());
+
+                if let Some(mutex) = opt_mutex {
+                    // Wait for the leader
+                    let _unused = mutex.lock().await;
+                    // Retry L1 check
+                    result = check_tier_fn().await;
+                    if result.is_some() {
+                        self.inner.l1_hits.fetch_add(1, Ordering::Relaxed);
+                        tier.record_hit();
+                        return Ok(result.map(|(v, _, _)| v));
+                    }
                 }
             }
 
-            // Check remaining tiers with promotion
-            let result = self.get_multi_tier(key).await?;
+            if let Some((v, value, ttl)) = result {
+                tier.record_hit();
 
-            if result.is_some() {
-                // Hit in L2+ tier - update legacy stats
-                if self
-                    .tiers
-                    .as_ref()
-                    .unwrap_or_else(|| panic!("Tiers initialized"))
-                    .len()
-                    >= 2
-                {
-                    self.l2_hits.fetch_add(1, Ordering::Relaxed);
+                // Hit on Lower Tier (L2+) -> Promote to Upper Tiers
+                if idx >= 1 {
+                    self.inner.l2_hits.fetch_add(1, Ordering::Relaxed);
                 }
-            } else {
-                self.misses.fetch_add(1, Ordering::Relaxed);
+
+                if tier.promotion_enabled {
+                    let promo_ttl = ttl.unwrap_or_else(|| CacheStrategy::Default.to_duration());
+                    // Promote to all tiers above this one
+                    for up in tiers.iter().take(idx).rev() {
+                        let _ = up.set_with_ttl(key, &value, promo_ttl).await;
+                        tracing::debug!(
+                            "Promoted '{}' from L{} to L{}",
+                            key,
+                            tier.tier_level,
+                            up.tier_level
+                        );
+                    }
+                    self.inner.promotions.fetch_add(1, Ordering::Relaxed);
+                }
+                return Ok(Some(v));
             }
-
-            drop(cleanup_guard);
-            return Ok(result);
         }
-
-        // LEGACY: 2-tier mode (L1 + L2)
-        // Fast path: Try L1 first (no locking needed)
-        if let Some(value) = self.l1_cache.get(key).await {
-            self.l1_hits.fetch_add(1, Ordering::Relaxed);
-            return Ok(Some(value));
-        }
-
-        // L1 miss - implement Cache Stampede protection for L2 lookup
-        let key_arc: Arc<str> = Arc::from(key);
-        let lock_guard = self
-            .in_flight_requests
-            .entry(Arc::clone(&key_arc))
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone();
-
-        let _guard = lock_guard.lock().await;
-
-        // RAII cleanup guard - ensures entry is removed even on early return or panic
-        let cleanup_guard = CleanupGuard {
-            map: &self.in_flight_requests,
-            key: Arc::clone(&key_arc),
-        };
-
-        // Double-check L1 cache after acquiring lock
-        // (Another concurrent request might have populated it while we were waiting)
-        if let Some(value) = self.l1_cache.get(key).await {
-            self.l1_hits.fetch_add(1, Ordering::Relaxed);
-            // cleanup_guard will auto-remove entry on drop
-            return Ok(Some(value));
-        }
-
-        // Check L2 cache with TTL information
-        if let Some((value, ttl)) = self.l2_cache.get_with_ttl(key).await {
-            self.l2_hits.fetch_add(1, Ordering::Relaxed);
-
-            // Promote to L1 with same TTL as Redis (or default if no TTL)
-            let promotion_ttl = ttl.unwrap_or_else(|| CacheStrategy::Default.to_duration());
-
-            if self
-                .l1_cache
-                .set_with_ttl(key, value.clone(), promotion_ttl)
-                .await
-                .is_err()
-            {
-                // L1 promotion failed, but we still have the data
-                warn!("Failed to promote key '{}' to L1 cache", key);
-            } else {
-                self.promotions.fetch_add(1, Ordering::Relaxed);
-                debug!(
-                    "Promoted '{}' from L2 to L1 with TTL {:?} (via get)",
-                    key, promotion_ttl
-                );
-            }
-
-            // cleanup_guard will auto-remove entry on drop
-            return Ok(Some(value));
-        }
-
-        // Both L1 and L2 miss
-        self.misses.fetch_add(1, Ordering::Relaxed);
-
-        // cleanup_guard will auto-remove entry on drop
-        drop(cleanup_guard);
-
         Ok(None)
     }
 
-    /// Set value with specific cache strategy (all tiers)
+    async fn get_legacy<T: DeserializeOwned>(
+        &self,
+        key: &str,
+        allow_wait: bool,
+    ) -> Result<Option<T>> {
+        // 1. Check L1
+        if let Some(value) = self.inner.l1_cache.get(key).await {
+            match self.inner.codec.deserialize(&value) {
+                Ok(v) => {
+                    self.inner.l1_hits.fetch_add(1, Ordering::Relaxed);
+                    return Ok(Some(v));
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Cache deserialization failed for key '{}' in L1: {}",
+                        key,
+                        e
+                    );
+                }
+            }
+        }
+
+        // 2. Stampede Check (L1 Miss)
+        if allow_wait {
+            let opt_mutex = self
+                .inner
+                .in_flight_requests
+                .get(key)
+                .map(|r| r.value().clone());
+
+            if let Some(mutex) = opt_mutex {
+                let _unused = mutex.lock().await;
+                // Check L1 again
+                if let Some(value) = self.inner.l1_cache.get(key).await {
+                    if let Ok(v) = self.inner.codec.deserialize(&value) {
+                        self.inner.l1_hits.fetch_add(1, Ordering::Relaxed);
+                        return Ok(Some(v));
+                    }
+                }
+            }
+        }
+
+        // 3. Check L2
+        if let Some((value, ttl)) = self.inner.l2_cache.get_with_ttl(key).await {
+            match self.inner.codec.deserialize(&value) {
+                Ok(v) => {
+                    self.inner.l2_hits.fetch_add(1, Ordering::Relaxed);
+                    let promo_ttl = ttl.unwrap_or_else(|| CacheStrategy::Default.to_duration());
+                    let _ = self
+                        .inner
+                        .l1_cache
+                        .set_with_ttl(key, &value, promo_ttl)
+                        .await;
+                    self.inner.promotions.fetch_add(1, Ordering::Relaxed);
+                    return Ok(Some(v));
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Cache deserialization failed for key '{}' in L2: {}",
+                        key,
+                        e
+                    );
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Internal get implementation with controllable stampede waiting
+    async fn get_internal<T: DeserializeOwned>(
+        &self,
+        key: &str,
+        allow_wait: bool,
+    ) -> Result<Option<T>> {
+        self.inner.total_requests.fetch_add(1, Ordering::Relaxed);
+
+        let result = if let Some(tiers) = self.inner.tiers.as_ref() {
+            self.get_multi_tier(tiers, key, allow_wait).await?
+        } else {
+            self.get_legacy(key, allow_wait).await?
+        };
+
+        if result.is_none() {
+            self.inner.misses.fetch_add(1, Ordering::Relaxed);
+        }
+
+        Ok(result)
+    }
+
+    /// Set (update) a value in all configured tiers.
     ///
-    /// Supports both legacy 2-tier mode and new multi-tier mode (v0.5.0+).
-    /// In multi-tier mode, stores to ALL tiers with their respective TTL scaling.
+    /// # The Flow
+    /// 1. Serialize the value `T` to bytes using the active `CacheCodec`.
+    /// 2. Iterate through all tiers (L1, L2, L3...).
+    /// 3. Store the bytes concurrently (or sequentially, depending on implementation).
     ///
-    /// This method is optimized to avoid unnecessary cloning: it clones the value
-    /// for the first N-1 tiers and **moves** the original into the last tier,
-    /// saving one full deep clone of the JSON value per call.
+    /// # Arguments
+    ///
+    /// * `key` - The cache key.
+    /// * `value` - The value to store.
+    /// * `strategy` - The strategy determining the TTL (e.g., Short-Term, Long-Term).
     ///
     /// # Errors
     ///
-    /// Returns an error if all cache tiers fail to store the value.
-    pub async fn set_with_strategy(
+    /// Returns `Err` if *all* tiers fail to store the value. If only some tiers fail,
+    /// it logs an error but returns `Ok(())` for the operation.
+    pub async fn set_with_strategy<T: Serialize + ?Sized>(
         &self,
         key: &str,
-        value: serde_json::Value,
+        value: &T,
         strategy: CacheStrategy,
     ) -> Result<()> {
         let ttl = strategy.to_duration();
+        let bytes = self.inner.codec.serialize(value)?;
 
-        // Multi-tier mode (v0.5.0+)
-        if let Some(tiers) = &self.tiers {
-            let mut success_count = 0;
-            let mut last_error = None;
-            let tier_count = tiers.len();
-
-            // Clone for all tiers except the last; move the original into the last tier.
-            // Split into (init, last) to avoid Option/expect and eliminate one deep clone.
-            let (init_tiers, last_tier) = tiers.split_at(tier_count.saturating_sub(1));
-
-            for tier in init_tiers {
-                match tier.set_with_ttl(key, value.clone(), ttl).await {
-                    Ok(()) => success_count += 1,
-                    Err(e) => {
-                        error!(
-                            "L{} cache set failed for key '{}': {}",
-                            tier.tier_level, key, e
-                        );
-                        last_error = Some(e);
-                    }
+        if let Some(tiers) = &self.inner.tiers {
+            let mut ok = false;
+            for tier in tiers {
+                if tier.set_with_ttl(key, &bytes, ttl).await.is_ok() {
+                    ok = true;
                 }
             }
-
-            // Last tier: move the original value (no clone)
-            if let Some(tier) = last_tier.first() {
-                match tier.set_with_ttl(key, value, ttl).await {
-                    Ok(()) => success_count += 1,
-                    Err(e) => {
-                        error!(
-                            "L{} cache set failed for key '{}': {}",
-                            tier.tier_level, key, e
-                        );
-                        last_error = Some(e);
-                    }
-                }
-            }
-
-            if success_count > 0 {
-                debug!(
-                    "[Multi-Tier] Cached '{}' in {}/{} tiers (base TTL: {:?})",
-                    key, success_count, tier_count, ttl
-                );
-                return Ok(());
-            }
-            return Err(
-                last_error.unwrap_or_else(|| anyhow::anyhow!("All tiers failed for key '{key}'"))
-            );
-        }
-
-        // Legacy 2-tier mode (L1 + L2): clone for L1, move into L2
-        let l1_result = self.l1_cache.set_with_ttl(key, value.clone(), ttl).await;
-        let l2_result = self.l2_cache.set_with_ttl(key, value, ttl).await;
-
-        match (l1_result, l2_result) {
-            (Ok(()), Ok(())) => {
-                debug!("[L1+L2] Cached '{}' with TTL {:?}", key, ttl);
+            if ok {
                 Ok(())
-            }
-            (Ok(()), Err(_)) => {
-                warn!("L2 cache set failed for key '{}', continuing with L1", key);
-                Ok(())
-            }
-            (Err(_), Ok(())) => {
-                warn!("L1 cache set failed for key '{}', continuing with L2", key);
-                Ok(())
-            }
-            (Err(e1), Err(_e2)) => Err(anyhow::anyhow!(
-                "Both L1 and L2 cache set failed for key '{key}': {e1}"
-            )),
-        }
-    }
-
-    /// Get or compute value with Cache Stampede protection across L1+L2+Compute
-    ///
-    /// This method provides comprehensive Cache Stampede protection:
-    /// 1. Check L1 cache first (uses Moka's built-in coalescing)
-    /// 2. Check L2 cache with mutex-based coalescing
-    /// 3. Compute fresh data with protection against concurrent computations
-    ///
-    /// # Arguments
-    /// * `key` - Cache key
-    /// * `strategy` - Cache strategy for TTL and storage behavior
-    /// * `compute_fn` - Async function to compute the value if not in any cache
-    ///
-    /// # Example
-    /// ```ignore
-    /// let api_data = cache_manager.get_or_compute_with(
-    ///     "api_response",
-    ///     CacheStrategy::RealTime,
-    ///     || async {
-    ///         fetch_data_from_api().await
-    ///     }
-    /// ).await?;
-    /// ```
-    #[allow(dead_code)]
-    /// # Errors
-    ///
-    /// Returns an error if compute function fails or cache operations fail.
-    pub async fn get_or_compute_with<F, Fut>(
-        &self,
-        key: &str,
-        strategy: CacheStrategy,
-        compute_fn: F,
-    ) -> Result<serde_json::Value>
-    where
-        F: FnOnce() -> Fut + Send,
-        Fut: Future<Output = Result<serde_json::Value>> + Send,
-    {
-        self.total_requests.fetch_add(1, Ordering::Relaxed);
-
-        // 1. Try L1 cache first (with built-in Moka coalescing for hot data)
-        if let Some(value) = self.l1_cache.get(key).await {
-            self.l1_hits.fetch_add(1, Ordering::Relaxed);
-            return Ok(value);
-        }
-
-        // 2. L1 miss - try L2 with Cache Stampede protection
-        let key_arc: Arc<str> = Arc::from(key);
-        let lock_guard = self
-            .in_flight_requests
-            .entry(Arc::clone(&key_arc))
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone();
-
-        let _guard = lock_guard.lock().await;
-
-        // RAII cleanup guard - ensures entry is removed even on early return or panic
-        let _cleanup_guard = CleanupGuard {
-            map: &self.in_flight_requests,
-            key: key_arc,
-        };
-
-        // 3. Double-check L1 cache after acquiring lock
-        // (Another request might have populated it while we were waiting)
-        if let Some(value) = self.l1_cache.get(key).await {
-            self.l1_hits.fetch_add(1, Ordering::Relaxed);
-            // _cleanup_guard will auto-remove entry on drop
-            return Ok(value);
-        }
-
-        // 4. Check remaining tiers (L2, L3, L4...) with Stampede protection
-        if let Some(tiers) = &self.tiers {
-            // Check tiers starting from index 1 (skip L1 since already checked)
-            for tier in tiers.iter().skip(1) {
-                if let Some((value, ttl)) = tier.get_with_ttl(key).await {
-                    tier.record_hit();
-
-                    let promotion_ttl = ttl.unwrap_or_else(|| strategy.to_duration());
-
-                    // Promote to L1 (first tier)
-                    if let Some(l1_tier) = tiers.first() {
-                        if let Err(e) = l1_tier
-                            .set_with_ttl(key, value.clone(), promotion_ttl)
-                            .await
-                        {
-                            warn!(
-                                "Failed to promote '{}' from L{} to L1: {}",
-                                key, tier.tier_level, e
-                            );
-                        } else {
-                            self.promotions.fetch_add(1, Ordering::Relaxed);
-                            debug!(
-                                "Promoted '{}' from L{} to L1 with TTL {:?} (Stampede protected)",
-                                key, tier.tier_level, promotion_ttl
-                            );
-                        }
-                    }
-
-                    // _cleanup_guard will auto-remove entry on drop
-                    return Ok(value);
-                }
+            } else {
+                Err(anyhow::anyhow!("All tiers failed"))
             }
         } else {
-            // LEGACY: Check L2 cache with TTL
-            if let Some((value, redis_ttl)) = self.l2_cache.get_with_ttl(key).await {
-                self.l2_hits.fetch_add(1, Ordering::Relaxed);
-
-                // Promote to L1 using Redis TTL (or strategy TTL as fallback)
-                let promotion_ttl = redis_ttl.unwrap_or_else(|| strategy.to_duration());
-
-                if let Err(e) = self
-                    .l1_cache
-                    .set_with_ttl(key, value.clone(), promotion_ttl)
-                    .await
-                {
-                    warn!("Failed to promote key '{}' to L1: {}", key, e);
-                } else {
-                    self.promotions.fetch_add(1, Ordering::Relaxed);
-                    debug!(
-                        "Promoted '{}' from L2 to L1 with TTL {:?}",
-                        key, promotion_ttl
-                    );
-                }
-
-                // _cleanup_guard will auto-remove entry on drop
-                return Ok(value);
+            let l1 = self.inner.l1_cache.set_with_ttl(key, &bytes, ttl).await;
+            let l2 = self.inner.l2_cache.set_with_ttl(key, &bytes, ttl).await;
+            if l1.is_err() && l2.is_err() {
+                Err(anyhow::anyhow!("Both failed"))
+            } else {
+                Ok(())
             }
         }
-
-        // 5. Cache miss across all tiers - compute fresh data
-        debug!(
-            "Computing fresh data for key: '{}' (Cache Stampede protected)",
-            key
-        );
-        let fresh_data = compute_fn().await?;
-
-        // 6. Store in both caches
-        if let Err(e) = self
-            .set_with_strategy(key, fresh_data.clone(), strategy)
-            .await
-        {
-            warn!("Failed to cache computed data for key '{}': {}", key, e);
-        }
-
-        // 7. _cleanup_guard will auto-remove entry on drop
-
-        Ok(fresh_data)
     }
 
-    /// Get or compute typed value with Cache Stampede protection (Type-Safe Version)
+    /// Retrieve a value or compute it if missing (Stampede Protected).
     ///
-    /// This method provides the same functionality as `get_or_compute_with()` but with
-    /// **type-safe** automatic serialization/deserialization. Perfect for database queries,
-    /// API calls, or any computation that returns structured data.
+    /// The `get_or_compute` method implements a classic "Read-Check-Compute" flow
+    /// with robust **Cache Stampede Protection**:
     ///
-    /// # Type Safety
+    /// 0. **Fast Get**: Check L1 (In-Memory) -> L2 (Redis).
+    /// 1. **Found**: Return `T` immediately.
+    /// 2. **Miss**: Acquire a `Mutex` for this *specific key* (other keys are unaffected).
+    /// 3. **Wait**: Wait for other requests for this key to potentially fill the cache.
+    /// 4. **Check Again**: Once lock acquired, check cache again.
+    /// 5. **Compute**: If still missing, run `compute_fn()`.
+    /// 6. **Fill**: Store result in L1 & L2 with `strategy` TTL.
+    /// 7. **Release**: Release lock to unblock other readers.
     ///
-    /// - Returns your actual type `T` instead of `serde_json::Value`
-    /// - Compiler enforces Serialize + `DeserializeOwned` bounds
-    /// - No manual JSON conversion needed
+    /// # Type Parameters
     ///
-    /// # Cache Flow
-    ///
-    /// 1. Check L1 cache → deserialize if found
-    /// 2. Check L2 cache → deserialize + promote to L1 if found
-    /// 3. Execute `compute_fn` → serialize → store in L1+L2
-    /// 4. Full stampede protection (only ONE request computes)
+    /// * `F`: Compute function returning a Future.
+    /// * `Fut`: The future returned by F, resolving to `Result<T>`.
     ///
     /// # Arguments
     ///
-    /// * `key` - Cache key
-    /// * `strategy` - Cache strategy for TTL
-    /// * `compute_fn` - Async function returning `Result<T>`
+    /// * `key` - The cache key.
+    /// * `strategy` - TTL strategy for storing the computed value.
+    /// * `compute_fn` - An async closure to call if the key is missing.
     ///
-    /// # Example - Database Query
+    /// # Example: API Call
     ///
-    /// ```no_run
-    /// # use multi_tier_cache::{CacheManager, CacheStrategy, L1Cache, L2Cache, MokaCacheConfig};
-    /// # use std::sync::Arc;
-    /// # use serde::{Serialize, Deserialize};
-    /// # async fn example() -> anyhow::Result<()> {
-    /// # let l1 = Arc::new(L1Cache::new(MokaCacheConfig::default())?);
-    /// # let l2 = Arc::new(L2Cache::new().await?);
-    /// # let cache_manager = CacheManager::new(l1, l2);
+    /// ```rust,no_run
+    /// # use multi_tier_cache::*;
+    /// # async fn fetch_user_api(id: u64) -> anyhow::Result<String> { Ok("alice".into()) }
+    /// # async fn example(cache: CacheManager) -> anyhow::Result<()> {
+    /// let user_id = 42;
+    /// let key = format!("user:{user_id}");
     ///
-    /// #[derive(Serialize, Deserialize)]
-    /// struct User {
-    ///     id: i64,
-    ///     name: String,
-    /// }
-    ///
-    /// // Type-safe database caching (example - requires sqlx)
-    /// // let user: User = cache_manager.get_or_compute_typed(
-    /// //     "user:123",
-    /// //     CacheStrategy::MediumTerm,
-    /// //     || async {
-    /// //         sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = $1")
-    /// //             .bind(123)
-    /// //             .fetch_one(&pool)
-    /// //             .await
-    /// //     }
-    /// // ).await?;
+    /// // Only ONE request will hit the API even if 1000 requests arrive concurrently
+    /// let user = cache.get_or_compute(&key, CacheStrategy::ShortTerm, || {
+    ///     async move { fetch_user_api(user_id).await }
+    /// }).await?;
     /// # Ok(())
     /// # }
     /// ```
-    ///
-    /// # Example - API Call
-    ///
-    /// ```no_run
-    /// # use multi_tier_cache::{CacheManager, CacheStrategy, L1Cache, L2Cache, MokaCacheConfig};
-    /// # use std::sync::Arc;
-    /// # use serde::{Serialize, Deserialize};
-    /// # async fn example() -> anyhow::Result<()> {
-    /// # let l1 = Arc::new(L1Cache::new(MokaCacheConfig::default())?);
-    /// # let l2 = Arc::new(L2Cache::new().await?);
-    /// # let cache_manager = CacheManager::new(l1, l2);
-    /// #[derive(Serialize, Deserialize)]
-    /// struct ApiResponse {
-    ///     data: String,
-    ///     timestamp: i64,
-    /// }
-    ///
-    /// // API call caching (example - requires reqwest)
-    /// // let response: ApiResponse = cache_manager.get_or_compute_typed(
-    /// //     "api:endpoint",
-    /// //     CacheStrategy::RealTime,
-    /// //     || async {
-    /// //         reqwest::get("https://api.example.com/data")
-    /// //             .await?
-    /// //             .json::<ApiResponse>()
-    /// //             .await
-    /// //     }
-    /// // ).await?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    ///
-    /// # Performance
-    ///
-    /// - L1 hit: <1ms + deserialization (~10-50μs for small structs)
-    /// - L2 hit: 2-5ms + deserialization + L1 promotion
-    /// - Compute: Your function time + serialization + L1+L2 storage
-    /// - Stampede protection: 99.6% latency reduction under high concurrency
-    ///
-    /// # Errors
-    ///
-    /// Returns error if:
-    /// - Compute function fails
-    /// - Serialization fails (invalid type for JSON)
-    /// - Deserialization fails (cache data doesn't match type T)
-    /// - Cache operations fail (Redis connection issues)
-    #[allow(clippy::too_many_lines)]
-    pub async fn get_or_compute_typed<T, F, Fut>(
+    pub async fn get_or_compute<T, F, Fut>(
         &self,
         key: &str,
         strategy: CacheStrategy,
         compute_fn: F,
     ) -> Result<T>
     where
-        T: serde::Serialize + serde::de::DeserializeOwned + Send + 'static,
+        T: Serialize + DeserializeOwned + Send,
         F: FnOnce() -> Fut + Send,
         Fut: Future<Output = Result<T>> + Send,
     {
-        self.total_requests.fetch_add(1, Ordering::Relaxed);
-
-        // 1. Try L1 cache first (with built-in Moka coalescing for hot data)
-        if let Some(cached_json) = self.l1_cache.get(key).await {
-            self.l1_hits.fetch_add(1, Ordering::Relaxed);
-
-            // Attempt to deserialize from JSON to type T
-            match serde_json::from_value::<T>(cached_json) {
-                Ok(typed_value) => {
-                    debug!(
-                        "[L1 HIT] Deserialized '{}' to type {}",
-                        key,
-                        std::any::type_name::<T>()
-                    );
-                    return Ok(typed_value);
-                }
-                Err(e) => {
-                    // Deserialization failed - cache data may be stale or corrupt
-                    warn!(
-                        "L1 cache deserialization failed for key '{}': {}. Will recompute.",
-                        key, e
-                    );
-                    // Fall through to recompute
-                }
-            }
+        if let Some(val) = self.get(key).await? {
+            return Ok(val);
         }
 
-        // 2. L1 miss - try L2 with Cache Stampede protection
+        // Compute lock
         let key_arc: Arc<str> = Arc::from(key);
         let lock_guard = self
+            .inner
             .in_flight_requests
             .entry(Arc::clone(&key_arc))
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone();
-
         let _guard = lock_guard.lock().await;
-
-        // RAII cleanup guard - ensures entry is removed even on early return or panic
-        let _cleanup_guard = CleanupGuard {
-            map: &self.in_flight_requests,
+        let _cleanup = CleanupGuard {
+            map: &self.inner.in_flight_requests,
             key: key_arc,
         };
 
-        // 3. Double-check L1 cache after acquiring lock
-        // (Another request might have populated it while we were waiting)
-        if let Some(cached_json) = self.l1_cache.get(key).await {
-            self.l1_hits.fetch_add(1, Ordering::Relaxed);
-            if let Ok(typed_value) = serde_json::from_value::<T>(cached_json) {
-                debug!("[L1 HIT] Deserialized '{}' after lock acquisition", key);
-                return Ok(typed_value);
-            }
+        // Double check
+        if let Some(val) = self.get_internal(key, false).await? {
+            return Ok(val);
         }
 
-        // 4. Check remaining tiers (L2, L3, L4...) with Stampede protection
-        if let Some(tiers) = &self.tiers {
-            // Check tiers starting from index 1 (skip L1 since already checked)
-            for tier in tiers.iter().skip(1) {
-                if let Some((cached_json, ttl)) = tier.get_with_ttl(key).await {
-                    tier.record_hit();
-
-                    // Attempt to deserialize
-                    match serde_json::from_value::<T>(cached_json.clone()) {
-                        Ok(typed_value) => {
-                            debug!(
-                                "[L{} HIT] Deserialized '{}' to type {}",
-                                tier.tier_level,
-                                key,
-                                std::any::type_name::<T>()
-                            );
-
-                            // Promote to L1 (first tier)
-                            let promotion_ttl = ttl.unwrap_or_else(|| strategy.to_duration());
-                            if let Some(tier) = tiers.first() {
-                                if let Err(e) =
-                                    tier.set_with_ttl(key, cached_json, promotion_ttl).await
-                                {
-                                    warn!(
-                                        "Failed to promote '{}' from L{} to L1: {}",
-                                        key, tier.tier_level, e
-                                    );
-                                } else {
-                                    self.promotions.fetch_add(1, Ordering::Relaxed);
-                                    debug!("Promoted '{}' from L{} to L1 with TTL {:?} (Stampede protected)",
-                                            key, tier.tier_level, promotion_ttl);
-                                }
-                            }
-
-                            return Ok(typed_value);
-                        }
-                        Err(e) => {
-                            warn!("L{} cache deserialization failed for key '{}': {}. Trying next tier.",
-                                     tier.tier_level, key, e);
-                            // Continue to next tier
-                        }
-                    }
-                }
-            }
-        } else {
-            // LEGACY: Check L2 cache with TTL
-            if let Some((cached_json, redis_ttl)) = self.l2_cache.get_with_ttl(key).await {
-                self.l2_hits.fetch_add(1, Ordering::Relaxed);
-
-                // Attempt to deserialize
-                match serde_json::from_value::<T>(cached_json.clone()) {
-                    Ok(typed_value) => {
-                        debug!("[L2 HIT] Deserialized '{}' from Redis", key);
-
-                        // Promote to L1 using Redis TTL (or strategy TTL as fallback)
-                        let promotion_ttl = redis_ttl.unwrap_or_else(|| strategy.to_duration());
-
-                        if let Err(e) = self
-                            .l1_cache
-                            .set_with_ttl(key, cached_json, promotion_ttl)
-                            .await
-                        {
-                            warn!("Failed to promote key '{}' to L1: {}", key, e);
-                        } else {
-                            self.promotions.fetch_add(1, Ordering::Relaxed);
-                            debug!(
-                                "Promoted '{}' from L2 to L1 with TTL {:?}",
-                                key, promotion_ttl
-                            );
-                        }
-
-                        return Ok(typed_value);
-                    }
-                    Err(e) => {
-                        warn!(
-                            "L2 cache deserialization failed for key '{}': {}. Will recompute.",
-                            key, e
-                        );
-                        // Fall through to recompute
-                    }
-                }
-            }
-        }
-
-        // 5. Cache miss across all tiers (or deserialization failed) - compute fresh data
-        debug!(
-            "Computing fresh typed data for key: '{}' (Cache Stampede protected)",
-            key
-        );
-        let typed_value = compute_fn().await?;
-
-        // 6. Serialize to JSON for storage
-        let json_value = serde_json::to_value(&typed_value).map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to serialize type {} for caching: {}",
-                std::any::type_name::<T>(),
-                e
-            )
-        })?;
-
-        // 7. Store in both L1 and L2 caches
-        if let Err(e) = self.set_with_strategy(key, json_value, strategy).await {
-            warn!(
-                "Failed to cache computed typed data for key '{}': {}",
-                key, e
-            );
-        } else {
-            debug!(
-                "Cached typed value for '{}' (type: {})",
-                key,
-                std::any::type_name::<T>()
-            );
-        }
-
-        // 8. _cleanup_guard will auto-remove entry on drop
-
-        Ok(typed_value)
+        let val = compute_fn().await?;
+        self.set_with_strategy(key, &val, strategy).await?;
+        Ok(val)
     }
 
-    /// Get comprehensive cache statistics
+    /// Invalidate (remove) a cached item from all tiers.
     ///
-    /// In multi-tier mode, aggregates statistics from all tiers.
-    /// In legacy mode, returns L1 and L2 stats.
-    #[allow(dead_code)]
-    pub fn get_stats(&self) -> CacheManagerStats {
-        let total_reqs = self.total_requests.load(Ordering::Relaxed);
-        let l1_hits = self.l1_hits.load(Ordering::Relaxed);
-        let l2_hits = self.l2_hits.load(Ordering::Relaxed);
-        let misses = self.misses.load(Ordering::Relaxed);
-
-        CacheManagerStats {
-            total_requests: total_reqs,
-            l1_hits,
-            l2_hits,
-            total_hits: l1_hits + l2_hits,
-            misses,
-            hit_rate: if total_reqs > 0 {
-                #[allow(clippy::cast_precision_loss)]
-                {
-                    ((l1_hits + l2_hits) as f64 / total_reqs as f64) * 100.0
-                }
-            } else {
-                0.0
-            },
-            l1_hit_rate: if total_reqs > 0 {
-                #[allow(clippy::cast_precision_loss)]
-                {
-                    (l1_hits as f64 / total_reqs as f64) * 100.0
-                }
-            } else {
-                0.0
-            },
-            promotions: self.promotions.load(Ordering::Relaxed),
-            in_flight_requests: self.in_flight_requests.len(),
-        }
-    }
-
-    /// Get per-tier statistics (v0.5.0+)
-    ///
-    /// Returns statistics for each tier if multi-tier mode is enabled.
-    /// Returns None if using legacy 2-tier mode.
-    ///
-    /// # Example
-    /// ```rust,ignore
-    /// if let Some(tier_stats) = cache_manager.get_tier_stats() {
-    ///     for stats in tier_stats {
-    ///         println!("L{}: {} hits ({})",
-    ///                  stats.tier_level,
-    ///                  stats.hit_count(),
-    ///                  stats.backend_name);
-    ///     }
-    /// }
-    /// ```
-    pub fn get_tier_stats(&self) -> Option<Vec<TierStats>> {
-        self.tiers
-            .as_ref()
-            .map(|tiers| tiers.iter().map(|tier| tier.stats.clone()).collect())
-    }
-
-    // ===== Redis Streams Methods =====
-
-    /// Publish data to Redis Stream
+    /// This removes the given `key` from both L1 and L2 (or all tiers in N-tier config).
+    /// If an invalidation publisher is configured (e.g., Redis `PubSub`), it broadcasts
+    /// an `Invalidate(key)` message to other instances.
     ///
     /// # Arguments
-    /// * `stream_key` - Name of the stream (e.g., "`events_stream`")
-    /// * `fields` - Field-value pairs to publish
-    /// * `maxlen` - Optional max length for stream trimming
     ///
-    /// # Returns
-    /// The entry ID generated by Redis
+    /// * `key` - The cache key to invalidate.
+    pub async fn invalidate(&self, key: &str) -> Result<()> {
+        if let Some(tiers) = &self.inner.tiers {
+            for tier in tiers {
+                let _ = tier.backend.remove(key).await;
+            }
+        } else {
+            let _ = self.inner.l1_cache.remove(key).await;
+            let _ = self.inner.l2_cache.remove(key).await;
+        }
+
+        if let Some(publ) = &self.inner.invalidation_publisher {
+            let mut p = publ.lock().await;
+            p.publish(&InvalidationMessage::remove(key)).await?;
+            self.inner
+                .invalidation_stats
+                .messages_sent
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
+    /// Update an item and broadcast the *new value* to other instances.
+    ///
+    /// This is a "Distributed Cache Update" - instead of invalidation (causing misses),
+    /// we proactively push the new value to peers.
+    ///
+    /// # Important
+    ///
+    /// This broadcasts the entire serialized payload. Use carefully.
+    ///
+    /// * `key` - The cache key to update.
+    /// * `value` - The new value.
+    /// * `strategy` - The strategy determining TTL.
+    pub async fn update_cache<T: Serialize + ?Sized>(
+        &self,
+        key: &str,
+        value: &T,
+        strategy: CacheStrategy,
+    ) -> Result<()> {
+        self.set_with_strategy(key, value, strategy).await?;
+
+        if let Some(publ) = &self.inner.invalidation_publisher {
+            let bytes = self.inner.codec.serialize(value)?;
+            let msg = InvalidationMessage::update(key, bytes, Some(strategy.to_duration()));
+            let mut p = publ.lock().await;
+            p.publish(&msg).await?;
+            self.inner
+                .invalidation_stats
+                .messages_sent
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
+    /// Set with broadcast (alias for `update_cache`)
+    pub async fn set_with_broadcast<T: Serialize + ?Sized>(
+        &self,
+        key: &str,
+        value: &T,
+        strategy: CacheStrategy,
+    ) -> Result<()> {
+        self.update_cache(key, value, strategy).await
+    }
+
+    /// Invalidate keys matching a glob pattern (e.g., `user:123:*`)
+    ///
+    /// # Important
+    ///
+    /// Requires a concrete L2 cache implementation (e.g., Redis) that supports `scan_keys`.
+    ///
+    /// * `pattern` - The wildcard pattern to invalidate.
+    pub async fn invalidate_pattern(&self, pattern: &str) -> Result<()> {
+        if let Some(tiers) = &self.inner.tiers {
+            for tier in tiers {
+                let _ = tier.backend.remove_pattern(pattern).await;
+            }
+        } else {
+            let _ = self.inner.l1_cache.remove_pattern(pattern).await;
+            // L2 pattern removal via scan_keys if concrete L2 available
+            if let Some(l2) = &self.inner.l2_cache_concrete {
+                let keys = l2.scan_keys(pattern, None).await?;
+                l2.remove_bulk(&keys).await?;
+            }
+        }
+
+        if let Some(publ) = &self.inner.invalidation_publisher {
+            let mut p = publ.lock().await;
+            p.publish(&InvalidationMessage::remove_pattern(pattern))
+                .await?;
+        }
+        Ok(())
+    }
+
+    // ===== Streaming Methods =====
+
+    /// Publish event to stream
+    ///
+    /// # Arguments
+    ///
+    /// * `stream_key` - Name of the stream (e.g. `events_v1`).
+    /// * `fields` - Key-value pairs to append to the stream.
+    /// * `maxlen` - Optional max length. If set, oldest entries are automatically trimmed.
     ///
     /// # Errors
-    /// Returns error if streaming backend is not configured
+    ///
+    /// Returns `Err` if streaming is not configured or the backend fails.
     pub async fn publish_to_stream(
         &self,
         stream_key: &str,
         fields: Vec<(String, String)>,
         maxlen: Option<usize>,
     ) -> Result<String> {
-        match &self.streaming_backend {
-            Some(backend) => backend.stream_add(stream_key, fields, maxlen).await,
-            None => Err(anyhow::anyhow!("Streaming backend not configured")),
+        if let Some(backend) = &self.inner.streaming_backend {
+            backend.stream_add(stream_key, fields, maxlen).await
+        } else {
+            Err(anyhow::anyhow!("Streaming backend not configured"))
         }
     }
 
-    /// Read latest entries from Redis Stream
+    /// Read latest events from stream (LIFO-like access for initial load)
     ///
     /// # Arguments
-    /// * `stream_key` - Name of the stream
-    /// * `count` - Number of latest entries to retrieve
     ///
-    /// # Returns
-    /// Vector of (`entry_id`, fields) tuples (newest first)
-    ///
-    /// # Errors
-    /// Returns error if streaming backend is not configured
+    /// * `stream_key` - Stream name.
+    /// * `count` - Max number of recent entries to fetch.
     pub async fn read_stream_latest(
         &self,
         stream_key: &str,
         count: usize,
     ) -> Result<Vec<(String, Vec<(String, String)>)>> {
-        match &self.streaming_backend {
-            Some(backend) => backend.stream_read_latest(stream_key, count).await,
-            None => Err(anyhow::anyhow!("Streaming backend not configured")),
+        if let Some(backend) = &self.inner.streaming_backend {
+            backend.stream_read_latest(stream_key, count).await
+        } else {
+            Err(anyhow::anyhow!("Streaming backend not configured"))
         }
     }
 
-    /// Read from Redis Stream with optional blocking
+    /// Read events from stream (Blocking/Polling)
     ///
     /// # Arguments
-    /// * `stream_key` - Name of the stream
-    /// * `last_id` - Last ID seen ("0" for start, "$" for new only)
-    /// * `count` - Max entries to retrieve
-    /// * `block_ms` - Optional blocking timeout in ms
     ///
-    /// # Returns
-    /// Vector of (`entry_id`, fields) tuples
-    ///
-    /// # Errors
-    /// Returns error if streaming backend is not configured
+    /// * `stream_key` - Stream name.
+    /// * `last_id` - ID of the last processed message (use `$` for new only, or `0-0` for all).
+    /// * `count` - Max number of entries to read.
+    /// * `block_ms` - If `Some(ms)`, block up to `ms` milliseconds waiting for new items.
     pub async fn read_stream(
         &self,
         stream_key: &str,
@@ -1491,286 +906,120 @@ impl CacheManager {
         count: usize,
         block_ms: Option<usize>,
     ) -> Result<Vec<(String, Vec<(String, String)>)>> {
-        match &self.streaming_backend {
-            Some(backend) => {
-                backend
-                    .stream_read(stream_key, last_id, count, block_ms)
-                    .await
-            }
-            None => Err(anyhow::anyhow!("Streaming backend not configured")),
-        }
-    }
-
-    // ===== Cache Invalidation Methods =====
-
-    /// Invalidate a cache key across all instances
-    ///
-    /// This removes the key from all cache tiers and broadcasts
-    /// the invalidation to all other cache instances via Redis Pub/Sub.
-    ///
-    /// Supports both legacy 2-tier mode and new multi-tier mode (v0.5.0+).
-    ///
-    /// # Arguments
-    /// * `key` - Cache key to invalidate
-    ///
-    /// # Example
-    /// ```rust,no_run
-    /// # use multi_tier_cache::CacheManager;
-    /// # async fn example(cache_manager: &CacheManager) -> anyhow::Result<()> {
-    /// // Invalidate user cache after profile update
-    /// cache_manager.invalidate("user:123").await?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    /// # Errors
-    ///
-    /// Returns an error if invalidation fails.
-    pub async fn invalidate(&self, key: &str) -> Result<()> {
-        // NEW: Multi-tier mode (v0.5.0+)
-        if let Some(tiers) = &self.tiers {
-            // Remove from ALL tiers
-            for tier in tiers {
-                if let Err(e) = tier.remove(key).await {
-                    warn!(
-                        "Failed to remove '{}' from L{}: {}",
-                        key, tier.tier_level, e
-                    );
-                }
-            }
+        if let Some(backend) = &self.inner.streaming_backend {
+            backend
+                .stream_read(stream_key, last_id, count, block_ms)
+                .await
         } else {
-            // LEGACY: 2-tier mode
-            self.l1_cache.remove(key).await?;
-            self.l2_cache.remove(key).await?;
-        }
-
-        // Broadcast to other instances
-        if let Some(publisher) = &self.invalidation_publisher {
-            let mut pub_lock = publisher.lock().await;
-            let msg = InvalidationMessage::remove(key);
-            pub_lock.publish(&msg).await?;
-            self.invalidation_stats
-                .messages_sent
-                .fetch_add(1, Ordering::Relaxed);
-        }
-
-        debug!("Invalidated '{}' across all instances", key);
-        Ok(())
-    }
-
-    /// Update cache value across all instances
-    ///
-    /// This updates the key in all cache tiers and broadcasts
-    /// the update to all other cache instances, avoiding cache misses.
-    ///
-    /// Supports both legacy 2-tier mode and new multi-tier mode (v0.5.0+).
-    ///
-    /// # Arguments
-    /// * `key` - Cache key to update
-    /// * `value` - New value
-    /// * `ttl` - Optional TTL (uses default if None)
-    ///
-    /// # Example
-    /// ```rust,no_run
-    /// # use multi_tier_cache::CacheManager;
-    /// # use std::time::Duration;
-    /// # async fn example(cache_manager: &CacheManager) -> anyhow::Result<()> {
-    /// // Update user cache with new data
-    /// let user_data = serde_json::json!({"id": 123, "name": "Alice"});
-    /// cache_manager.update_cache("user:123", user_data, Some(Duration::from_secs(3600))).await?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    /// # Errors
-    ///
-    /// Returns an error if cache update fails.
-    pub async fn update_cache(
-        &self,
-        key: &str,
-        value: serde_json::Value,
-        ttl: Option<Duration>,
-    ) -> Result<()> {
-        let ttl = ttl.unwrap_or_else(|| CacheStrategy::Default.to_duration());
-
-        // NEW: Multi-tier mode (v0.5.0+)
-        if let Some(tiers) = &self.tiers {
-            // Update ALL tiers with their respective TTL scaling
-            for tier in tiers {
-                if let Err(e) = tier.set_with_ttl(key, value.clone(), ttl).await {
-                    warn!("Failed to update '{}' in L{}: {}", key, tier.tier_level, e);
-                }
-            }
-        } else {
-            // LEGACY: 2-tier mode
-            self.l1_cache.set_with_ttl(key, value.clone(), ttl).await?;
-            self.l2_cache.set_with_ttl(key, value.clone(), ttl).await?;
-        }
-
-        // Broadcast update to other instances
-        if let Some(publisher) = &self.invalidation_publisher {
-            let mut pub_lock = publisher.lock().await;
-            let msg = InvalidationMessage::update(key, value, Some(ttl));
-            pub_lock.publish(&msg).await?;
-            self.invalidation_stats
-                .messages_sent
-                .fetch_add(1, Ordering::Relaxed);
-        }
-
-        debug!("Updated '{}' across all instances", key);
-        Ok(())
-    }
-
-    /// Invalidate all keys matching a pattern
-    ///
-    /// This scans L2 cache for keys matching the pattern, removes them from all tiers,
-    /// and broadcasts the invalidation. L1 caches will be cleared via broadcast.
-    ///
-    /// Supports both legacy 2-tier mode and new multi-tier mode (v0.5.0+).
-    ///
-    /// **Note**: Pattern scanning requires a concrete `L2Cache` instance with `scan_keys()`.
-    /// In multi-tier mode, this scans from L2 but removes from all tiers.
-    ///
-    /// # Arguments
-    /// * `pattern` - Glob-style pattern (e.g., "user:*", "product:123:*")
-    ///
-    /// # Example
-    /// ```rust,no_run
-    /// # use multi_tier_cache::CacheManager;
-    /// # async fn example(cache_manager: &CacheManager) -> anyhow::Result<()> {
-    /// // Invalidate all user caches
-    /// cache_manager.invalidate_pattern("user:*").await?;
-    ///
-    /// // Invalidate specific user's related caches
-    /// cache_manager.invalidate_pattern("user:123:*").await?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    /// # Errors
-    ///
-    /// Returns an error if invalidation fails.
-    pub async fn invalidate_pattern(&self, pattern: &str) -> Result<()> {
-        // Scan L2 for matching keys
-        // (Note: Pattern scanning requires concrete L2Cache with scan_keys support)
-        let keys = if let Some(l2) = &self.l2_cache_concrete {
-            l2.scan_keys(pattern).await?
-        } else {
-            return Err(anyhow::anyhow!(
-                "Pattern invalidation requires concrete L2Cache instance"
-            ));
-        };
-
-        if keys.is_empty() {
-            debug!("No keys found matching pattern '{}'", pattern);
-            return Ok(());
-        }
-
-        // NEW: Multi-tier mode (v0.5.0+)
-        if let Some(tiers) = &self.tiers {
-            // Remove from ALL tiers
-            for key in &keys {
-                for tier in tiers {
-                    if let Err(e) = tier.remove(key).await {
-                        warn!(
-                            "Failed to remove '{}' from L{}: {}",
-                            key, tier.tier_level, e
-                        );
-                    }
-                }
-            }
-        } else {
-            // LEGACY: 2-tier mode - Remove from L2 in bulk
-            if let Some(l2) = &self.l2_cache_concrete {
-                l2.remove_bulk(&keys).await?;
-            }
-        }
-
-        // Broadcast pattern invalidation
-        if let Some(publisher) = &self.invalidation_publisher {
-            let mut pub_lock = publisher.lock().await;
-            let msg = InvalidationMessage::remove_bulk(keys.clone());
-            pub_lock.publish(&msg).await?;
-            self.invalidation_stats
-                .messages_sent
-                .fetch_add(1, Ordering::Relaxed);
-        }
-
-        debug!(
-            "Invalidated {} keys matching pattern '{}'",
-            keys.len(),
-            pattern
-        );
-        Ok(())
-    }
-
-    /// Set value with automatic broadcast to all instances
-    ///
-    /// This is a write-through operation that updates the cache and
-    /// broadcasts the update to all other instances automatically.
-    ///
-    /// # Arguments
-    /// * `key` - Cache key
-    /// * `value` - Value to cache
-    /// * `strategy` - Cache strategy (determines TTL)
-    ///
-    /// # Example
-    /// ```rust,no_run
-    /// # use multi_tier_cache::{CacheManager, CacheStrategy};
-    /// # async fn example(cache_manager: &CacheManager) -> anyhow::Result<()> {
-    /// // Update and broadcast in one call
-    /// let data = serde_json::json!({"status": "active"});
-    /// cache_manager.set_with_broadcast("user:123", data, CacheStrategy::MediumTerm).await?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    /// # Errors
-    ///
-    /// Returns an error if cache set or broadcast fails.
-    pub async fn set_with_broadcast(
-        &self,
-        key: &str,
-        value: serde_json::Value,
-        strategy: CacheStrategy,
-    ) -> Result<()> {
-        let ttl = strategy.to_duration();
-
-        // Set in local caches
-        self.set_with_strategy(key, value.clone(), strategy).await?;
-
-        // Broadcast update if invalidation is enabled
-        if let Some(publisher) = &self.invalidation_publisher {
-            let mut pub_lock = publisher.lock().await;
-            let msg = InvalidationMessage::update(key, value, Some(ttl));
-            pub_lock.publish(&msg).await?;
-            self.invalidation_stats
-                .messages_sent
-                .fetch_add(1, Ordering::Relaxed);
-        }
-
-        Ok(())
-    }
-
-    /// Get invalidation statistics
-    ///
-    /// Returns statistics about invalidation operations if invalidation is enabled.
-    pub fn get_invalidation_stats(&self) -> Option<InvalidationStats> {
-        if self.invalidation_subscriber.is_some() {
-            Some(self.invalidation_stats.snapshot())
-        } else {
-            None
+            Err(anyhow::anyhow!("Streaming backend not configured"))
         }
     }
 }
 
-/// Cache Manager statistics
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct CacheManagerStats {
     pub total_requests: u64,
     pub l1_hits: u64,
     pub l2_hits: u64,
-    pub total_hits: u64,
     pub misses: u64,
+    pub promotions: u64,
+    pub in_flight_requests: usize,
     pub hit_rate: f64,
     pub l1_hit_rate: f64,
-    pub promotions: usize,
-    pub in_flight_requests: usize,
+    pub l2_hit_rate: f64,
+    pub invalidation_stats: InvalidationStats,
+    pub tiers: Option<Vec<TierStats>>,
+}
+
+impl CacheManagerStats {
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn calculate_hit_rates(mut self) -> Self {
+        let total = self.total_requests as f64;
+        if total > 0.0 {
+            self.l1_hit_rate = self.l1_hits as f64 / total * 100.0;
+            self.l2_hit_rate = self.l2_hits as f64 / total * 100.0;
+            self.hit_rate = (self.l1_hits + self.l2_hits) as f64 / total * 100.0;
+        }
+        self
+    }
+}
+
+impl CacheManager<JsonCodec> {
+    pub fn new(l1: Arc<L1Cache>, l2: Arc<L2Cache>) -> Result<Self> {
+        let l1_backend: Arc<dyn CacheBackend> = l1.clone();
+        let l2_backend: Arc<dyn L2CacheBackend> = l2.clone();
+        Self::with_codec(l1_backend, l2_backend, None, JsonCodec::new())
+    }
+
+    pub async fn new_with_invalidation(
+        l1: Arc<L1Cache>,
+        l2: Arc<L2Cache>,
+        redis_url: &str,
+        config: InvalidationConfig,
+    ) -> Result<Self> {
+        let client = redis::Client::open(redis_url)?;
+        let conn_manager = redis::aio::ConnectionManager::new(client).await?;
+        let publisher = InvalidationPublisher::new(conn_manager, config.clone());
+        let subscriber = InvalidationSubscriber::new(redis_url, config.clone())?;
+
+        let l1_backend: Arc<dyn CacheBackend> = l1.clone();
+        let l2_backend: Arc<dyn L2CacheBackend> = l2.clone();
+        let l2_concrete = Some(l2.clone());
+
+        let manager = Self {
+            inner: Arc::new(CacheManagerInner {
+                tiers: None,
+                l1_cache: l1_backend,
+                l2_cache: l2_backend,
+                l2_cache_concrete: l2_concrete,
+                streaming_backend: None,
+                codec: Arc::new(JsonCodec::new()),
+                total_requests: AtomicU64::new(0),
+                l1_hits: AtomicU64::new(0),
+                l2_hits: AtomicU64::new(0),
+                misses: AtomicU64::new(0),
+                promotions: AtomicU64::new(0),
+                in_flight_requests: DashMap::new(),
+                invalidation_publisher: Some(Mutex::new(publisher)),
+                invalidation_subscriber: Some(subscriber),
+                invalidation_stats: Arc::new(AtomicInvalidationStats::default()),
+            }),
+        };
+
+        // Start subscriber logic
+        if let Some(sub) = &manager.inner.invalidation_subscriber {
+            let l1_ref = manager.inner.l1_cache.clone();
+            sub.start(move |msg| {
+                let l1 = l1_ref.clone();
+                async move {
+                    match msg {
+                        InvalidationMessage::Remove { key } => {
+                            let _ = l1.remove(&key).await;
+                        }
+                        InvalidationMessage::Update {
+                            key,
+                            value,
+                            ttl_secs,
+                        } => {
+                            let ttl =
+                                ttl_secs.map_or(Duration::from_secs(300), Duration::from_secs);
+                            let _ = l1.set_with_ttl(&key, &value, ttl).await;
+                        }
+                        InvalidationMessage::RemovePattern { pattern } => {
+                            let _ = l1.remove_pattern(&pattern).await;
+                        }
+                        InvalidationMessage::RemoveBulk { keys } => {
+                            for k in keys {
+                                let _ = l1.remove(&k).await;
+                            }
+                        }
+                    }
+                    Ok(())
+                }
+            });
+        }
+
+        Ok(manager)
+    }
 }

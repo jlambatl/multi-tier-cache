@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used)]
 //! Benchmarks for basic cache operations
 //!
 //! This benchmark suite measures the performance of:
@@ -7,7 +8,8 @@
 //! - Cache hit vs miss latency
 //! - Different data sizes
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use std::hint::black_box;
 use multi_tier_cache::{CacheBackend, CacheStrategy, CacheSystem};
 use serde_json::json;
 use std::time::Duration;
@@ -51,7 +53,7 @@ fn bench_cache_set(c: &mut Criterion) {
                     let key = format!("bench:set:{}", rand::random::<u32>());
                     cache
                         .cache_manager()
-                        .set_with_strategy(&key, black_box(data.clone()), CacheStrategy::ShortTerm)
+                        .set_with_strategy(&key, &black_box(data.clone()), CacheStrategy::ShortTerm)
                         .await
                         .unwrap_or_else(|_| panic!("Failed to set cache"));
                 });
@@ -64,7 +66,7 @@ fn bench_cache_set(c: &mut Criterion) {
                     let key = format!("bench:set:{}", rand::random::<u32>());
                     cache
                         .cache_manager()
-                        .set_with_strategy(&key, black_box(data.clone()), CacheStrategy::LongTerm)
+                        .set_with_strategy(&key, &black_box(data.clone()), CacheStrategy::LongTerm)
                         .await
                         .unwrap_or_else(|_| panic!("Failed to set cache"));
                 });
@@ -85,13 +87,13 @@ fn bench_l1_hit(c: &mut Criterion) {
             let key = format!("bench:l1:{i}");
             cache
                 .cache_manager()
-                .set_with_strategy(&key, test_data(1024), CacheStrategy::ShortTerm)
+                .set_with_strategy(&key, &test_data(1024), CacheStrategy::ShortTerm)
                 .await
                 .unwrap_or_else(|_| panic!("Failed to set cache"));
             // Warm up L1
             let _ = cache
                 .cache_manager()
-                .get(&key)
+                .get::<serde_json::Value>(&key)
                 .await
                 .unwrap_or_else(|_| panic!("Failed to get cache"));
         }
@@ -104,7 +106,7 @@ fn bench_l1_hit(c: &mut Criterion) {
                 black_box(
                     cache
                         .cache_manager()
-                        .get(&key)
+                        .get::<serde_json::Value>(&key)
                         .await
                         .unwrap_or_else(|_| panic!("Failed to get cache")),
                 );
@@ -122,7 +124,7 @@ fn bench_l2_hit(c: &mut Criterion) {
         for i in 0..100 {
             let key = format!("bench:l2:{i}");
             if let Some(l2) = &cache.l2_cache {
-                l2.set_with_ttl(&key, test_data(1024), Duration::from_secs(300))
+                l2.set_with_ttl(&key, &serde_json::to_vec(&test_data(1024)).unwrap(), Duration::from_secs(300))
                     .await
                     .unwrap_or_else(|_| panic!("Failed to set cache"));
             }
@@ -142,7 +144,7 @@ fn bench_l2_hit(c: &mut Criterion) {
                 black_box(
                     cache
                         .cache_manager()
-                        .get(&key)
+                        .get::<serde_json::Value>(&key)
                         .await
                         .unwrap_or_else(|_| panic!("Failed to get cache")),
                 );
@@ -162,7 +164,7 @@ fn bench_cache_miss(c: &mut Criterion) {
                 black_box(
                     cache
                         .cache_manager()
-                        .get(&key)
+                        .get::<serde_json::Value>(&key)
                         .await
                         .unwrap_or_else(|_| panic!("Failed to get cache")),
                 );
@@ -189,7 +191,7 @@ fn bench_compute_on_miss(c: &mut Criterion) {
 
                     cache
                         .cache_manager()
-                        .get_or_compute_with(&key, CacheStrategy::ShortTerm, || {
+                        .get_or_compute(&key, CacheStrategy::ShortTerm, || {
                             let d = data.clone();
                             async move {
                                 tokio::time::sleep(delay).await;
@@ -234,7 +236,7 @@ fn bench_typed_cache(c: &mut Criterion) {
                 // Set
                 cache
                     .cache_manager()
-                    .get_or_compute_typed(&key, CacheStrategy::ShortTerm, || {
+                    .get_or_compute(&key, CacheStrategy::ShortTerm, || {
                         let u = user.clone();
                         async move { Ok(u) }
                     })
@@ -245,7 +247,7 @@ fn bench_typed_cache(c: &mut Criterion) {
                 black_box(
                     cache
                         .cache_manager()
-                        .get_or_compute_typed::<User, _, _>(
+                        .get_or_compute::<User, _, _>(
                             &key,
                             CacheStrategy::ShortTerm,
                             || async {
@@ -282,7 +284,7 @@ fn bench_cache_strategies(c: &mut Criterion) {
                     let key = format!("bench:strategy:{}", rand::random::<u32>());
                     cache
                         .cache_manager()
-                        .set_with_strategy(&key, black_box(data.clone()), strategy.clone())
+                        .set_with_strategy(&key, &black_box(data.clone()), *strategy)
                         .await
                         .unwrap_or_else(|_| panic!("Failed to set cache"));
                 });

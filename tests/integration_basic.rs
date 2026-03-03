@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used)]
+#![allow(clippy::expect_used)]
 //! Basic integration tests for L1 and L2 cache operations
 //!
 //! These tests verify core functionality with real Redis instance.
@@ -20,7 +22,7 @@ async fn test_basic_set_and_get() {
     // Set value
     cache
         .cache_manager()
-        .set_with_strategy(&key, value.clone(), CacheStrategy::ShortTerm)
+        .set_with_strategy(&key, &value, CacheStrategy::ShortTerm)
         .await
         .unwrap_or_else(|_| panic!("Failed to set value"));
 
@@ -54,12 +56,12 @@ async fn test_l1_cache_hit() {
     // Set value (populates L1)
     cache
         .cache_manager()
-        .set_with_strategy(&key, value.clone(), CacheStrategy::MediumTerm)
+        .set_with_strategy(&key, &value, CacheStrategy::MediumTerm)
         .await
         .unwrap_or_else(|_| panic!("Failed to set cache"));
 
     // First get - should hit L1
-    let _ = cache
+    let _: Option<serde_json::Value> = cache
         .cache_manager()
         .get(&key)
         .await
@@ -100,7 +102,7 @@ async fn test_l2_to_l1_promotion() {
         .l2_cache
         .as_ref()
         .unwrap_or_else(|| panic!("L2 cache missing"))
-        .set_with_ttl(&key, value.clone(), Duration::from_secs(300))
+        .set_with_ttl(&key, &serde_json::to_vec(&value).unwrap(), Duration::from_secs(300))
         .await
         .unwrap_or_else(|_| panic!("Failed to set L2"));
 
@@ -142,7 +144,7 @@ async fn test_cache_miss() {
     let key = test_key("miss");
 
     // Get non-existent key
-    let cached = cache
+    let cached: Option<serde_json::Value> = cache
         .cache_manager()
         .get(&key)
         .await
@@ -166,7 +168,7 @@ async fn test_compute_on_miss() {
     // Compute on miss
     let value = cache
         .cache_manager()
-        .get_or_compute_with(&key, CacheStrategy::ShortTerm, || {
+        .get_or_compute(&key, CacheStrategy::ShortTerm, || {
             let v = expected_value.clone();
             async move { Ok(v) }
         })
@@ -204,7 +206,7 @@ async fn test_type_safe_caching() {
     // Store and retrieve with type safety
     let user: test_data::User = cache
         .cache_manager()
-        .get_or_compute_typed(&key, CacheStrategy::MediumTerm, || {
+        .get_or_compute(&key, CacheStrategy::MediumTerm, || {
             let u = expected_user.clone();
             async move { Ok(u) }
         })
@@ -216,7 +218,7 @@ async fn test_type_safe_caching() {
     // Verify it's cached
     let user2: test_data::User = cache
         .cache_manager()
-        .get_or_compute_typed(&key, CacheStrategy::MediumTerm, || async {
+        .get_or_compute(&key, CacheStrategy::MediumTerm, || async {
             panic!("Should not compute again");
         })
         .await
@@ -247,7 +249,7 @@ async fn test_ttl_expiration() {
         .cache_manager()
         .set_with_strategy(
             &key,
-            value.clone(),
+            &value,
             CacheStrategy::Custom(Duration::from_millis(100)),
         )
         .await
@@ -265,7 +267,7 @@ async fn test_ttl_expiration() {
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Should be expired now
-    let cached2 = cache
+    let cached2: Option<serde_json::Value> = cache
         .cache_manager()
         .get(&key)
         .await
@@ -296,16 +298,16 @@ async fn test_statistics_tracking() {
     // Perform operations
     cache
         .cache_manager()
-        .set_with_strategy(&key, value, CacheStrategy::ShortTerm)
+        .set_with_strategy(&key, &value, CacheStrategy::ShortTerm)
         .await
         .unwrap_or_else(|_| panic!("Failed to set cache"));
 
-    let _ = cache
+    let _: Option<serde_json::Value> = cache
         .cache_manager()
         .get(&key)
         .await
         .unwrap_or_else(|_| panic!("Failed to get cache")); // L1 hit
-    let _ = cache
+    let _: Option<serde_json::Value> = cache
         .cache_manager()
         .get(&test_key("nonexistent"))
         .await
@@ -360,7 +362,7 @@ async fn test_cache_strategies() {
 
         cache
             .cache_manager()
-            .set_with_strategy(&key, value.clone(), strategy)
+            .set_with_strategy(&key, &value, strategy)
             .await
             .unwrap_or_else(|_| panic!("Failed to set with {name} strategy"));
 
