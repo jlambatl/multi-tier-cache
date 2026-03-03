@@ -53,8 +53,12 @@ impl RedisCache {
     pub async fn with_url(redis_url: &str) -> Result<Self> {
         info!(redis_url = %redact_url(redis_url), "Initializing Redis Cache with ConnectionManager");
 
-        let client = Client::open(redis_url)
-            .with_context(|| format!("Failed to create Redis client with URL: {}", redact_url(redis_url)))?;
+        let client = Client::open(redis_url).with_context(|| {
+            format!(
+                "Failed to create Redis client with URL: {}",
+                redact_url(redis_url)
+            )
+        })?;
 
         // Create ConnectionManager - handles reconnection automatically
         let conn_manager = ConnectionManager::new(client)
@@ -95,10 +99,10 @@ impl RedisCache {
     /// # async fn example() -> anyhow::Result<()> {
     /// # let cache = RedisCache::new().await?;
     /// // Find all user cache keys
-    /// let keys = cache.scan_keys("user:*").await?;
+    /// let keys = cache.scan_keys("user:*", None).await?;
     ///
     /// // Find specific user's cache keys
-    /// let keys = cache.scan_keys("user:123:*").await?;
+    /// let keys = cache.scan_keys("user:123:*", None).await?;
     /// # Ok(())
     /// # }
     /// ```
@@ -196,7 +200,7 @@ impl CacheBackend for RedisCache {
         // Use pset_ex for millisecond precision
         let ttl_millis = u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX);
         let _: () = conn.pset_ex(key, value, ttl_millis).await?;
-        
+
         self.sets.fetch_add(1, Ordering::Relaxed);
         debug!(key = %key, ttl_ms = %ttl_millis, "[Redis] Cached key with TTL");
         Ok(())
@@ -243,10 +247,12 @@ impl L2CacheBackend for RedisCache {
         // Use pipeline to get value and PTTL in a single round-trip
         let result: (Option<Vec<u8>>, i64) = if let Ok(r) = redis::pipe()
             .atomic()
-            .cmd("GET").arg(key)
-            .cmd("PTTL").arg(key)
+            .cmd("GET")
+            .arg(key)
+            .cmd("PTTL")
+            .arg(key)
             .query_async(&mut conn)
-            .await 
+            .await
         {
             r
         } else {

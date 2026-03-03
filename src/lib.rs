@@ -25,11 +25,11 @@
 //!     // Store data with cache strategy
 //!     let data = serde_json::json!({"user": "alice", "score": 100});
 //!     cache.cache_manager()
-//!         .set_with_strategy("user:1", data, CacheStrategy::ShortTerm)
+//!         .set_with_strategy("user:1", &data, CacheStrategy::ShortTerm)
 //!         .await?;
 //!
 //!     // Retrieve data (L1 first, then L2 fallback)
-//!     if let Some(cached) = cache.cache_manager().get("user:1").await? {
+//!     if let Some(cached) = cache.cache_manager().get::<serde_json::Value>("user:1").await? {
 //!         tracing::info!("Cached data: {}", cached);
 //!     }
 //!
@@ -157,11 +157,18 @@ impl<C: CacheCodec> CacheSystem<C> {
         // Initialize L2 cache (Redis)
         let l2_cache = Arc::new(L2Cache::new().await?);
 
+        // Initialize Redis Streams
+        let redis_url =
+            std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+        let streams = Arc::new(RedisStreams::new(&redis_url).await?);
+        let streaming_backend: Option<Arc<dyn StreamingBackend>> = Some(streams);
+
         let l1_backend: Arc<dyn CacheBackend> = l1_cache.clone();
         let l2_backend: Arc<dyn L2CacheBackend> = l2_cache.clone();
 
         // Initialize cache manager
-        let cache_manager = CacheManager::with_codec(l1_backend, l2_backend, None, codec)?;
+        let cache_manager =
+            CacheManager::with_codec(l1_backend, l2_backend, streaming_backend, codec)?;
 
         info!("Multi-Tier Cache System initialized successfully");
 
@@ -231,24 +238,7 @@ impl CacheSystem<JsonCodec> {
     ///
     /// Returns an error if cache initialization fails.
     pub async fn new() -> Result<Self> {
-        info!("Initializing Multi-Tier Cache System");
-
-        // Initialize L1 cache (Moka)
-        let l1_cache = Arc::new(L1Cache::new(MokaCacheConfig::default())?);
-
-        // Initialize L2 cache (Redis)
-        let l2_cache = Arc::new(L2Cache::new().await?);
-
-        // Initialize cache manager
-        let cache_manager = Arc::new(CacheManager::new(l1_cache.clone(), l2_cache.clone())?);
-
-        info!("Multi-Tier Cache System initialized successfully");
-
-        Ok(Self {
-            cache_manager,
-            l1_cache: Some(l1_cache),
-            l2_cache: Some(l2_cache),
-        })
+        Self::with_codec(JsonCodec::new()).await
     }
 
     /// Create cache system with custom Redis URL
@@ -278,18 +268,24 @@ impl CacheSystem<JsonCodec> {
         let l1_cache = Arc::new(L1Cache::new(MokaCacheConfig::default())?);
 
         // Initialize L2 cache (Redis) with custom URL
+        // Initialize Redis Streams (using same URL)
+        // We create L2 and Streams in parallel or sequentially.
         let l2_cache = Arc::new(L2Cache::with_url(redis_url).await?);
+        let streams = Arc::new(RedisStreams::new(redis_url).await?);
+        let streaming_backend: Option<Arc<dyn StreamingBackend>> = Some(streams);
 
         // Initialize cache manager
-        let cache_manager = Arc::new(CacheManager::new(
-            Arc::clone(&l1_cache),
-            Arc::clone(&l2_cache),
-        )?);
+        let cache_manager = CacheManager::with_codec(
+            l1_cache.clone(),
+            l2_cache.clone(),
+            streaming_backend,
+            JsonCodec::new(),
+        )?;
 
         info!("Multi-Tier Cache System initialized successfully");
 
         Ok(Self {
-            cache_manager,
+            cache_manager: Arc::new(cache_manager),
             l1_cache: Some(l1_cache),
             l2_cache: Some(l2_cache),
         })

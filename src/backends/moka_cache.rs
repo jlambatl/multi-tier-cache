@@ -163,21 +163,22 @@ impl CacheBackend for MokaCache {
     async fn remove_pattern(&self, pattern: &str) -> Result<()> {
         let pattern_owned = pattern.to_string();
 
-        // Use invalidate_entries_if for atomic removal of matching keys
-        // Note: Simple glob support (only supports trailing * for now)
-        let result = self.cache.invalidate_entries_if(move |k, _v| {
+        let mut keys_to_remove = Vec::new();
+
+        // Use iter() to find keys matching the pattern
+        for (k, _v) in self.cache.iter() {
             if pattern_owned.ends_with('*') {
                 let prefix = &pattern_owned[..pattern_owned.len() - 1];
-                k.starts_with(prefix)
-            } else {
-                k == &pattern_owned
+                if k.starts_with(prefix) {
+                    keys_to_remove.push(k.as_ref().clone());
+                }
+            } else if k.as_str() == pattern_owned {
+                keys_to_remove.push(k.as_ref().clone());
             }
-        });
+        }
 
-        if let Err(e) = result {
-            return Err(anyhow::anyhow!(
-                "Moka invalidation failed for pattern '{pattern}': {e}"
-            ));
+        for k in keys_to_remove {
+            self.cache.remove(&k).await;
         }
 
         debug!("Invalidated pattern '{}' from Moka cache", pattern);

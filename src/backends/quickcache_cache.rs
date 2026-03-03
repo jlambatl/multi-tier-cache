@@ -65,10 +65,10 @@ impl QuickCacheBackend {
     /// # use multi_tier_cache::backends::QuickCacheBackend;
     /// # async fn example() -> anyhow::Result<()> {
     /// // Default capacity (2000 entries)
-    /// let cache = QuickCacheBackend::new(2000).await?;
+    /// let cache = QuickCacheBackend::new(2000)?;
     ///
     /// // Custom capacity
-    /// let cache = QuickCacheBackend::new(10000).await?;
+    /// let cache = QuickCacheBackend::new(10000)?;
     /// # Ok(())
     /// # }
     /// ```

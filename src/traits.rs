@@ -20,11 +20,11 @@
 ///
 /// #[async_trait]
 /// impl CacheBackend for MyCustomCache {
-///     async fn get(&self, key: &str) -> Option<serde_json::Value> {
+///     async fn get(&self, key: &str) -> Option<Vec<u8>> {
 ///         None
 ///     }
 ///
-///     async fn set_with_ttl(&self, key: &str, value: serde_json::Value, ttl: Duration) -> Result<()> {
+///     async fn set_with_ttl(&self, key: &str, value: &[u8], ttl: Duration) -> Result<()> {
 ///         Ok(())
 ///     }
 ///

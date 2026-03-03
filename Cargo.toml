@@ -27,8 +27,8 @@ futures-util = "0.3"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 postcard = { version = "1.0", features = ["alloc"], optional = true }
-simd-json = { version = "0.17", optional = true }
-sonic-rs = { version = "0.5.7", optional = true }
+simd-json = { version = "0.17", optional = true, default-features = false, features = ["swar-number-parsing", "serde_impl", "runtime-detection"] }
+sonic-rs = { version = "0.5.7", optional = true, default-features = false, features = ["avx512"]}
 
 # Error handling
 anyhow = "1.0"
