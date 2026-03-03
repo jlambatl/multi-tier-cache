@@ -5,7 +5,6 @@
 
 use anyhow::Result;
 use dashmap::DashMap;
-use serde_json;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -14,12 +13,12 @@ use tracing::{debug, info};
 /// Cache entry with expiration tracking
 #[derive(Debug, Clone)]
 struct CacheEntry {
-    value: serde_json::Value,
+    value: Vec<u8>,
     expires_at: Option<Instant>,
 }
 
 impl CacheEntry {
-    fn new(value: serde_json::Value, ttl: Duration) -> Self {
+    fn new(value: Vec<u8>, ttl: Duration) -> Self {
         Self {
             value,
             expires_at: Some(Instant::now() + ttl),
@@ -60,9 +59,9 @@ impl CacheEntry {
 ///
 /// # async fn example() -> anyhow::Result<()> {
 /// let cache = DashMapCache::new();
-/// let value = serde_json::json!({"user": "alice"});
+/// let value = b"some data".to_vec();
 ///
-/// cache.set_with_ttl("user:1", value.clone(), Duration::from_secs(60)).await?;
+/// cache.set_with_ttl("user:1", &value, Duration::from_secs(60)).await?;
 /// let cached = cache.get("user:1").await;
 /// assert_eq!(cached, Some(value));
 /// # Ok(())
@@ -139,7 +138,7 @@ use async_trait::async_trait;
 /// Implement `CacheBackend` trait for `DashMapCache`
 #[async_trait]
 impl CacheBackend for DashMapCache {
-    async fn get(&self, key: &str) -> Option<serde_json::Value> {
+    async fn get(&self, key: &str) -> Option<Vec<u8>> {
         if let Some(entry) = self.map.get(key) {
             if entry.is_expired() {
                 // Remove expired entry
@@ -157,8 +156,8 @@ impl CacheBackend for DashMapCache {
         }
     }
 
-    async fn set_with_ttl(&self, key: &str, value: serde_json::Value, ttl: Duration) -> Result<()> {
-        let entry = CacheEntry::new(value, ttl);
+    async fn set_with_ttl(&self, key: &str, value: &[u8], ttl: Duration) -> Result<()> {
+        let entry = CacheEntry::new(value.to_vec(), ttl);
         self.map.insert(key.to_string(), entry);
         self.sets.fetch_add(1, Ordering::Relaxed);
         debug!(key = %key, ttl_secs = %ttl.as_secs(), "[DashMap] Cached key with TTL");
@@ -172,10 +171,10 @@ impl CacheBackend for DashMapCache {
 
     async fn health_check(&self) -> bool {
         let test_key = "health_check_dashmap";
-        let test_value = serde_json::json!({"test": true});
+        let test_value = b"health_check_value".to_vec();
 
         match self
-            .set_with_ttl(test_key, test_value.clone(), Duration::from_secs(60))
+            .set_with_ttl(test_key, &test_value, Duration::from_secs(60))
             .await
         {
             Ok(()) => match self.get(test_key).await {

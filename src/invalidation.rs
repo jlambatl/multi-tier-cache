@@ -21,7 +21,7 @@ pub enum InvalidationMessage {
     /// This is more efficient than Remove for hot keys as it avoids cache miss
     Update {
         key: String,
-        value: serde_json::Value,
+        value: Vec<u8>,
         #[serde(skip_serializing_if = "Option::is_none")]
         ttl_secs: Option<u64>,
     },
@@ -41,7 +41,7 @@ impl InvalidationMessage {
     }
 
     /// Create an Update message
-    pub fn update(key: impl Into<String>, value: serde_json::Value, ttl: Option<Duration>) -> Self {
+    pub fn update(key: impl Into<String>, value: Vec<u8>, ttl: Option<Duration>) -> Self {
         Self::Update {
             key: key.into(),
             value,
@@ -502,7 +502,7 @@ mod tests {
         // Test Update
         let msg = InvalidationMessage::update(
             "test_key",
-            serde_json::json!({"value": 123}),
+            vec![1, 2, 3],
             Some(Duration::from_secs(300)),
         );
         let json = msg.to_json()?;
@@ -514,7 +514,7 @@ mod tests {
                 ttl_secs,
             } => {
                 assert_eq!(key, "test_key");
-                assert_eq!(value, serde_json::json!({"value": 123}));
+                assert_eq!(value, vec![1, 2, 3]);
                 assert_eq!(ttl_secs, Some(300));
             }
             _ => panic!("Wrong message type"),

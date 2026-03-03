@@ -1,9 +1,10 @@
 //! Benchmarks for serialization and type-safe caching
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use multi_tier_cache::{CacheStrategy, CacheSystem};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::hint::black_box;
 use std::time::Duration;
 use tokio::runtime::Runtime;
 
@@ -53,14 +54,14 @@ fn bench_json_vs_typed(c: &mut Criterion) {
 
                 cache
                     .cache_manager()
-                    .set_with_strategy(&key, user, CacheStrategy::ShortTerm)
+                    .set_with_strategy(&key, &user, CacheStrategy::ShortTerm)
                     .await
                     .unwrap_or_else(|_| panic!("Failed to set cache"));
 
                 black_box(
                     cache
                         .cache_manager()
-                        .get(&key)
+                        .get::<serde_json::Value>(&key)
                         .await
                         .unwrap_or_else(|_| panic!("Failed to get cache")),
                 );
@@ -76,7 +77,7 @@ fn bench_json_vs_typed(c: &mut Criterion) {
 
                 cache
                     .cache_manager()
-                    .get_or_compute_typed(&key, CacheStrategy::ShortTerm, || {
+                    .get_or_compute(&key, CacheStrategy::ShortTerm, || {
                         let u = user.clone();
                         async move { Ok(u) }
                     })
@@ -86,13 +87,42 @@ fn bench_json_vs_typed(c: &mut Criterion) {
                 black_box(
                     cache
                         .cache_manager()
-                        .get_or_compute_typed::<User, _, _>(
-                            &key,
-                            CacheStrategy::ShortTerm,
-                            || async {
-                                panic!("Should not compute");
-                            },
-                        )
+                        .get_or_compute::<User, _, _>(&key, CacheStrategy::ShortTerm, || async {
+                            panic!("Should not compute");
+                        })
+                        .await
+                        .unwrap_or_else(|_| panic!("Failed to get cache")),
+                );
+            });
+        });
+    });
+
+    #[cfg(feature = "codec-sonic-rs")]
+    group.bench_function("sonic_cache", |b| {
+        use multi_tier_cache::codecs::SonicRsCodec;
+        let sonic_cache =
+            rt.block_on(async { CacheSystem::with_codec(SonicRsCodec::new()).unwrap() });
+
+        b.iter(|| {
+            rt.block_on(async {
+                let key = format!("bench:sonic:{}", rand::random::<u32>());
+                let user = User::new(123);
+
+                sonic_cache
+                    .cache_manager()
+                    .get_or_compute(&key, CacheStrategy::ShortTerm, || {
+                        let u = user.clone();
+                        async move { Ok(u) }
+                    })
+                    .await
+                    .unwrap_or_else(|_| panic!("Failed to set cache"));
+
+                black_box(
+                    sonic_cache
+                        .cache_manager()
+                        .get_or_compute::<User, _, _>(&key, CacheStrategy::ShortTerm, || async {
+                            panic!("Should not compute");
+                        })
                         .await
                         .unwrap_or_else(|_| panic!("Failed to get cache")),
                 );
@@ -119,14 +149,14 @@ fn bench_data_sizes(c: &mut Criterion) {
 
                     cache
                         .cache_manager()
-                        .set_with_strategy(&key, data, CacheStrategy::ShortTerm)
+                        .set_with_strategy(&key, &data, CacheStrategy::ShortTerm)
                         .await
                         .unwrap_or_else(|_| panic!("Failed to set cache"));
 
                     black_box(
                         cache
                             .cache_manager()
-                            .get(&key)
+                            .get::<serde_json::Value>(&key)
                             .await
                             .unwrap_or_else(|_| panic!("Failed to get cache")),
                     );

@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used)]
+#![allow(clippy::expect_used)]
 //! Integration tests for multi-tier cache architecture (v0.5.0+)
 
 use multi_tier_cache::{CacheBackend, CacheStrategy, CacheSystemBuilder, L2Cache, TierConfig};
@@ -43,19 +45,19 @@ async fn test_multi_tier_basic_operations() {
     // Test set_with_strategy - should store in all tiers
     let test_data = json!({"user": "alice", "id": 123});
     manager
-        .set_with_strategy("test:multi:1", test_data.clone(), CacheStrategy::ShortTerm)
+        .set_with_strategy("test:multi:1", &test_data, CacheStrategy::ShortTerm)
         .await
         .unwrap_or_else(|_| panic!("Failed to set cache"));
 
     // Test get - should hit L1
-    let result = manager
+    let result: Option<serde_json::Value> = manager
         .get("test:multi:1")
         .await
         .unwrap_or_else(|_| panic!("Failed to get cache"));
     assert_eq!(result, Some(test_data.clone()));
 
     // Verify tier stats
-    if let Some(tier_stats) = manager.get_tier_stats() {
+    if let Some(tier_stats) = manager.get_stats().tiers {
         println!("Multi-tier stats:");
         for stats in &tier_stats {
             println!(
@@ -105,20 +107,20 @@ async fn test_multi_tier_stats() {
     // Store some data
     let test_data = json!({"stats": "test"});
     manager
-        .set_with_strategy("test:stats:1", test_data.clone(), CacheStrategy::ShortTerm)
+        .set_with_strategy("test:stats:1", &test_data, CacheStrategy::ShortTerm)
         .await
         .unwrap_or_else(|_| panic!("Failed to set cache"));
 
     // Retrieve data multiple times
     for _ in 0..5 {
-        let _result = manager
+        let _result: Option<serde_json::Value> = manager
             .get("test:stats:1")
             .await
             .unwrap_or_else(|_| panic!("Failed to get cache"));
     }
 
     // Verify tier-specific stats
-    if let Some(tier_stats) = manager.get_tier_stats() {
+    if let Some(tier_stats) = manager.get_stats().tiers {
         assert_eq!(tier_stats.len(), 3, "Should have 3 tiers");
 
         // L1 should have most hits
@@ -159,7 +161,7 @@ async fn test_backward_compatibility_legacy_mode() {
     // Standard operations should work
     let test_data = json!({"legacy": "mode"});
     manager
-        .set_with_strategy("test:legacy:1", test_data.clone(), CacheStrategy::ShortTerm)
+        .set_with_strategy("test:legacy:1", &test_data, CacheStrategy::ShortTerm)
         .await
         .unwrap_or_else(|_| panic!("Failed to set cache"));
 
@@ -171,7 +173,7 @@ async fn test_backward_compatibility_legacy_mode() {
 
     // Tier stats should be None for legacy mode
     assert!(
-        manager.get_tier_stats().is_none(),
+        manager.get_stats().tiers.is_none(),
         "Legacy mode should not have tier stats"
     );
 
@@ -219,7 +221,7 @@ async fn test_multi_tier_ttl_scaling() {
     manager
         .set_with_strategy(
             "test:ttl:1",
-            test_data,
+            &test_data,
             CacheStrategy::Custom(Duration::from_secs(10)),
         )
         .await
@@ -228,7 +230,7 @@ async fn test_multi_tier_ttl_scaling() {
     // L1 and L2 should have 10s TTL, L3 should have 20s TTL (2x multiplier)
     // We can't directly verify TTL from outside, but the operation should succeed
 
-    let result = manager
+    let result: Option<serde_json::Value> = manager
         .get("test:ttl:1")
         .await
         .unwrap_or_else(|_| panic!("Failed to get cache"));
@@ -261,7 +263,7 @@ async fn test_multi_tier_cache_miss() {
     let manager = cache.cache_manager();
 
     // Try to get non-existent key
-    let result = manager
+    let result: Option<serde_json::Value> = manager
         .get("test:miss:nonexistent")
         .await
         .unwrap_or_else(|_| panic!("Failed to get cache"));
@@ -311,7 +313,7 @@ async fn test_convenience_methods() {
     let manager = cache.cache_manager();
 
     // Verify tier stats
-    if let Some(tier_stats) = manager.get_tier_stats() {
+    if let Some(tier_stats) = manager.get_stats().tiers {
         // Should have L1 + L2 + L3 + L4 = 4 tiers
         assert_eq!(tier_stats.len(), 4, "Should have 4 tiers");
 
@@ -373,7 +375,7 @@ async fn test_multi_tier_stampede_protection() {
 
         tasks.spawn(async move {
             manager_clone
-                .get_or_compute_with(&key_clone, CacheStrategy::ShortTerm, || {
+                .get_or_compute(&key_clone, CacheStrategy::ShortTerm, || {
                     counter_clone.fetch_add(1, Ordering::SeqCst);
                     async move { Ok(test_data::json_user(999)) }
                 })
@@ -396,7 +398,7 @@ async fn test_multi_tier_stampede_protection() {
     );
 
     // Verify data is in L1
-    let cached_in_l1 = manager
+    let cached_in_l1: Option<serde_json::Value> = manager
         .get(&key)
         .await
         .unwrap_or_else(|_| panic!("Failed to get cache"));
@@ -443,7 +445,8 @@ async fn test_stampede_retrieves_from_l3() {
     let data = test_data::json_user(777);
 
     // Pre-populate ONLY L3 (skip L1 and L2)
-    l3.set_with_ttl(&key, data.clone(), std::time::Duration::from_secs(300))
+    let bytes = serde_json::to_vec(&data).unwrap();
+    l3.set_with_ttl(&key, &bytes, std::time::Duration::from_secs(300))
         .await
         .unwrap_or_else(|_| panic!("Failed to set L3"));
 
@@ -458,7 +461,7 @@ async fn test_stampede_retrieves_from_l3() {
 
         tasks.spawn(async move {
             manager_clone
-                .get_or_compute_with(&key_clone, CacheStrategy::ShortTerm, || {
+                .get_or_compute::<serde_json::Value, _, _>(&key_clone, CacheStrategy::ShortTerm, || {
                     counter_clone.fetch_add(1, Ordering::SeqCst);
                     async move {
                         // This should NEVER be called since data is in L3
@@ -486,8 +489,9 @@ async fn test_stampede_retrieves_from_l3() {
     // Verify data was promoted to L1
     let l1_data = l1.get(&key).await;
     assert!(l1_data.is_some(), "Data should be promoted from L3 to L1");
+    let l1_val: serde_json::Value = serde_json::from_slice(&l1_data.unwrap()).unwrap();
     assert_eq!(
-        l1_data.unwrap_or_else(|| panic!("L1 data missing")),
+        l1_val,
         data,
         "Promoted data should match original"
     );

@@ -1,3 +1,7 @@
+#![allow(clippy::missing_errors_doc)]
+#![allow(clippy::must_use_candidate)]
+#![allow(clippy::module_name_repetitions)]
+#![allow(clippy::needless_pass_by_value)]
 //! Multi-Tier Cache
 //!
 //! A high-performance, production-ready multi-tier caching library for Rust featuring:
@@ -62,6 +66,7 @@ pub mod builder;
 pub mod cache_manager;
 pub mod invalidation;
 pub mod redis_streams;
+pub mod codecs;
 pub mod traits;
 pub mod utils;
 
@@ -91,12 +96,13 @@ pub use cache_manager::{
     TierConfig,
     TierStats,
 };
+pub use codecs::JsonCodec;
 pub use invalidation::{
     InvalidationConfig, InvalidationMessage, InvalidationPublisher, InvalidationStats,
     InvalidationSubscriber,
 };
 pub use redis_streams::RedisStreams;
-pub use traits::{CacheBackend, L2CacheBackend, StreamingBackend};
+pub use traits::{CacheBackend, CacheCodec, L2CacheBackend, StreamingBackend};
 
 // Re-export async_trait for user convenience
 pub use async_trait::async_trait;
@@ -127,16 +133,50 @@ pub use async_trait::async_trait;
 /// When using multi-tier mode or custom backends, `l1_cache` and `l2_cache`
 /// may be `None`. Always use `cache_manager()` for cache operations.
 #[derive(Clone)]
-pub struct CacheSystem {
+pub struct CacheSystem<C: CacheCodec = JsonCodec> {
     /// Unified cache manager (primary interface)
-    pub cache_manager: Arc<CacheManager>,
+    pub cache_manager: Arc<CacheManager<C>>,
     /// L1 Cache (in-memory, Moka) - `None` when using custom backends
     pub l1_cache: Option<Arc<L1Cache>>,
     /// L2 Cache (distributed, Redis) - `None` when using custom backends
     pub l2_cache: Option<Arc<L2Cache>>,
 }
 
-impl CacheSystem {
+impl<C: CacheCodec> CacheSystem<C> {
+    /// Perform health check on all cache tiers
+    ///
+    /// Returns `true` if at least L1 is operational.
+    /// L2 failure is tolerated (graceful degradation).
+    pub async fn health_check(&self) -> bool {
+        let l1_ok = match &self.l1_cache {
+            Some(cache) => cache.health_check().await,
+            None => true, // If no L1 cache instance, assume OK (using custom backends)
+        };
+
+        let l2_ok = match &self.l2_cache {
+            Some(cache) => cache.health_check().await,
+            None => true, // If no L2 cache instance, assume OK (using custom backends)
+        };
+
+        if l1_ok && l2_ok {
+            info!("Multi-Tier Cache health check passed");
+            true
+        } else {
+            warn!(l1_ok = %l1_ok, l2_ok = %l2_ok, "Multi-Tier Cache health check - partial failure");
+            l1_ok // At minimum, L1 should work
+        }
+    }
+
+    /// Get reference to cache manager (primary interface)
+    ///
+    /// Use this for all cache operations: get, set, streams, etc.
+    #[must_use]
+    pub fn cache_manager(&self) -> &Arc<CacheManager<C>> {
+        &self.cache_manager
+    }
+}
+
+impl CacheSystem<JsonCodec> {
     /// Create new cache system with default configuration
     ///
     /// # Configuration
@@ -171,7 +211,7 @@ impl CacheSystem {
         let l2_cache = Arc::new(L2Cache::new().await?);
 
         // Initialize cache manager
-        let cache_manager = Arc::new(CacheManager::new(l1_cache.clone(), l2_cache.clone()).await?);
+        let cache_manager = Arc::new(CacheManager::new(l1_cache.clone(), l2_cache.clone())?);
 
         info!("Multi-Tier Cache System initialized successfully");
 
@@ -213,7 +253,7 @@ impl CacheSystem {
 
         // Initialize cache manager
         let cache_manager =
-            Arc::new(CacheManager::new(Arc::clone(&l1_cache), Arc::clone(&l2_cache)).await?);
+            Arc::new(CacheManager::new(Arc::clone(&l1_cache), Arc::clone(&l2_cache))?);
 
         info!("Multi-Tier Cache System initialized successfully");
 
@@ -222,54 +262,5 @@ impl CacheSystem {
             l1_cache: Some(l1_cache),
             l2_cache: Some(l2_cache),
         })
-    }
-
-    /// Perform health check on all cache tiers
-    ///
-    /// Returns `true` if at least L1 is operational.
-    /// L2 failure is tolerated (graceful degradation).
-    ///
-    /// # Example
-    ///
-    /// ```rust,no_run
-    /// use multi_tier_cache::CacheSystem;
-    ///
-    /// #[tokio::main]
-    /// async fn main() -> anyhow::Result<()> {
-    ///     let cache = CacheSystem::new().await?;
-    ///
-    ///     if cache.health_check().await {
-    ///         tracing::info!("Cache system healthy");
-    ///     }
-    ///
-    ///     Ok(())
-    /// }
-    /// ```
-    pub async fn health_check(&self) -> bool {
-        let l1_ok = match &self.l1_cache {
-            Some(cache) => cache.health_check().await,
-            None => true, // If no L1 cache instance, assume OK (using custom backends)
-        };
-
-        let l2_ok = match &self.l2_cache {
-            Some(cache) => cache.health_check().await,
-            None => true, // If no L2 cache instance, assume OK (using custom backends)
-        };
-
-        if l1_ok && l2_ok {
-            info!("Multi-Tier Cache health check passed");
-            true
-        } else {
-            warn!(l1_ok = %l1_ok, l2_ok = %l2_ok, "Multi-Tier Cache health check - partial failure");
-            l1_ok // At minimum, L1 should work
-        }
-    }
-
-    /// Get reference to cache manager (primary interface)
-    ///
-    /// Use this for all cache operations: get, set, streams, etc.
-    #[must_use]
-    pub fn cache_manager(&self) -> &Arc<CacheManager> {
-        &self.cache_manager
     }
 }

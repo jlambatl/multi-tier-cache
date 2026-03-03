@@ -44,7 +44,7 @@ async fn main() -> anyhow::Result<()> {
             // Try to get or compute
             let result = cache_clone
                 .cache_manager()
-                .get_or_compute_with("stampede_test_key", CacheStrategy::ShortTerm, || {
+                .get_or_compute("stampede_test_key", CacheStrategy::ShortTerm, || {
                     expensive_computation(i)
                 })
                 .await;
@@ -78,7 +78,7 @@ async fn main() -> anyhow::Result<()> {
     let stats = cache.cache_manager().get_stats();
     println!("\n=== Cache Statistics ===");
     println!("Total requests: {}", stats.total_requests);
-    println!("Cache hits: {}", stats.total_hits);
+    println!("Cache hits: {}", stats.l1_hits + stats.l2_hits);
     println!(
         "In-flight requests (coalesced): {}",
         stats.in_flight_requests
