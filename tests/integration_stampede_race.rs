@@ -23,7 +23,7 @@
 
 use anyhow::Result;
 use multi_tier_cache::{
-    async_trait, CacheBackend, CacheManager, CacheStrategy, CacheTier, L2CacheBackend, JsonCodec,
+    async_trait, CacheBackend, CacheManager, CacheStrategy, CacheTier, JsonCodec, L2CacheBackend,
 };
 use serde_json::json;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -54,12 +54,7 @@ impl CacheBackend for InMemoryBackend {
         self.store.get(key).map(|v| v.value().clone())
     }
 
-    async fn set_with_ttl(
-        &self,
-        key: &str,
-        value: &[u8],
-        _ttl: Duration,
-    ) -> Result<()> {
+    async fn set_with_ttl(&self, key: &str, value: &[u8], _ttl: Duration) -> Result<()> {
         self.store.insert(key.to_string(), value.to_vec());
         Ok(())
     }
@@ -110,12 +105,7 @@ impl CacheBackend for SlowWriteBackend {
         self.store.get(key).map(|v| v.value().clone())
     }
 
-    async fn set_with_ttl(
-        &self,
-        key: &str,
-        value: &[u8],
-        _ttl: Duration,
-    ) -> Result<()> {
+    async fn set_with_ttl(&self, key: &str, value: &[u8], _ttl: Duration) -> Result<()> {
         if self.slow_writes.load(Ordering::SeqCst) {
             tokio::time::sleep(self.write_delay).await;
         }
@@ -155,7 +145,9 @@ fn build_manager(l1: Arc<dyn L2CacheBackend>, l2: Arc<dyn L2CacheBackend>) -> Ar
         CacheTier::new(l1, 1, false, 1.0),
         CacheTier::new(l2, 2, true, 1.0),
     ];
-    Arc::new(CacheManager::with_tiers_and_codec(tiers, None, JsonCodec::new()).expect("CacheManager"))
+    Arc::new(
+        CacheManager::with_tiers_and_codec(tiers, None, JsonCodec::new()).expect("CacheManager"),
+    )
 }
 
 // =============================================================================

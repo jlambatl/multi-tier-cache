@@ -20,15 +20,15 @@ quick_cache = { version = "0.6", optional = true }
 parking_lot = { version = "0.12", optional = true }
 
 # Async runtime
-tokio = { version = "1.49", features = ["sync", "macros", "time"] }
+tokio = { version = "1.50.0", features = ["sync", "macros", "time"] }
 futures-util = "0.3"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 postcard = { version = "1.0", features = ["alloc"], optional = true }
-simd-json = { version = "0.17", optional = true, default-features = false, features = ["swar-number-parsing", "serde_impl", "runtime-detection"] }
-sonic-rs = { version = "0.5.7", optional = true, default-features = false, features = ["avx512"]}
+simd-json = { version = "0.17", optional = true, default-features = false, features = ["swar-number-parsing", "runtime-detection", "serde_impl"] }
+sonic-rs = { version = "0.5.7", optional = true, default-features = false, features = ["avx512"] }
 
 # Error handling
 anyhow = "1.0"
@@ -48,6 +48,7 @@ criterion = "0.8"
 rand = "0.10"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
+dhat = "0.3"
 
 [features]
 default = ["redis-streams"]
@@ -76,6 +77,14 @@ harness = false
 
 [[bench]]
 name = "multi_tier"
+harness = false
+
+[[bench]]
+name = "performance_baseline"
+harness = false
+
+[[bench]]
+name = "heap_profile"
 harness = false
 
 [lints.clippy]

@@ -65,7 +65,11 @@ async fn test_update_cache() {
 
     // Update cache
     cache
-        .update_cache(&key, &value2, CacheStrategy::Custom(Duration::from_secs(300)))
+        .update_cache(
+            &key,
+            &value2,
+            CacheStrategy::Custom(Duration::from_secs(300)),
+        )
         .await
         .unwrap_or_else(|_| panic!("Failed to update cache"));
 

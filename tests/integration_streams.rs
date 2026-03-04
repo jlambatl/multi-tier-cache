@@ -24,7 +24,7 @@ async fn test_stream_publish() {
         .cache_manager()
         .publish_to_stream(&stream_key, fields, Some(100))
         .await
-        .unwrap_or_else(|e| panic!("Failed to publish to stream: {}", e));
+        .unwrap_or_else(|e| panic!("Failed to publish to stream: {e}"));
 
     assert!(!entry_id.is_empty());
 }

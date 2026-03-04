@@ -61,6 +61,32 @@ use anyhow::Result;
 use std::sync::Arc;
 use tracing::{info, warn};
 
+/// Health status for cache system components
+#[derive(Debug, Clone)]
+pub struct HealthStatus {
+    /// Overall health (true if L1 is operational)
+    pub healthy: bool,
+    /// L1 cache status
+    pub l1_ok: bool,
+    /// L2 cache status
+    pub l2_ok: bool,
+    /// L2 memory usage statistics (if available)
+    pub l2_memory: Option<MemoryStats>,
+}
+
+/// Memory usage statistics for L2 cache
+#[derive(Debug, Clone)]
+pub struct MemoryStats {
+    /// Used memory in bytes
+    pub used_bytes: u64,
+    /// Max memory limit in bytes (0 if unlimited)
+    pub max_bytes: u64,
+    /// Memory fragmentation ratio
+    pub fragmentation_ratio: f64,
+    /// Memory pressure (true if approaching limit)
+    pub pressure: bool,
+}
+
 pub mod backends;
 pub mod builder;
 pub mod cache_manager;
@@ -200,6 +226,73 @@ impl<C: CacheCodec> CacheSystem<C> {
         } else {
             warn!(l1_ok = %l1_ok, l2_ok = %l2_ok, "Multi-Tier Cache health check - partial failure");
             l1_ok // At minimum, L1 should work
+        }
+    }
+
+    /// Get detailed health status including memory metrics
+    ///
+    /// Returns comprehensive health information for all cache tiers,
+    /// including memory usage statistics for Redis L2.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use multi_tier_cache::CacheSystem;
+    /// # async fn example() -> anyhow::Result<()> {
+    /// # let cache = CacheSystem::new().await?;
+    /// let status = cache.health_status().await;
+    /// if !status.healthy {
+    ///     eprintln!("Cache unhealthy: L1={}, L2={}", status.l1_ok, status.l2_ok);
+    /// }
+    /// if let Some(mem) = &status.l2_memory {
+    ///     if mem.pressure {
+    ///         eprintln!("Memory pressure: {}/{} bytes", mem.used_bytes, mem.max_bytes);
+    ///     }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn health_status(&self) -> HealthStatus {
+        let l1_ok = match &self.l1_cache {
+            Some(cache) => cache.health_check().await,
+            None => true,
+        };
+
+        let l2_ok = match &self.l2_cache {
+            Some(cache) => cache.health_check().await,
+            None => true,
+        };
+
+        // Get L2 memory stats if available
+        let l2_memory = if let Some(l2) = &self.l2_cache {
+            match l2.get_memory_stats().await {
+                Ok((used, max, frag)) => {
+                    let pressure = if max > 0 {
+                        #[allow(clippy::cast_precision_loss)]
+                        let ratio = used as f64 / max as f64;
+                        ratio >= 0.8 // 80% threshold
+                    } else {
+                        false
+                    };
+
+                    Some(MemoryStats {
+                        used_bytes: used,
+                        max_bytes: max,
+                        fragmentation_ratio: frag,
+                        pressure,
+                    })
+                }
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+
+        HealthStatus {
+            healthy: l1_ok,
+            l1_ok,
+            l2_ok,
+            l2_memory,
         }
     }
 

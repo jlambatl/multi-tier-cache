@@ -51,6 +51,7 @@ pub use dashmap_cache::DashMapCache;
 pub use moka_cache::MokaCache;
 pub use moka_cache::MokaCacheConfig;
 pub use redis_cache::RedisCache;
+pub use redis_cache::RedisMemoryConfig;
 
 #[cfg(feature = "backend-memcached")]
 pub use memcached_cache::MemcachedCache;

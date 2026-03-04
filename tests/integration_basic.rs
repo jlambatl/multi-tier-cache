@@ -102,7 +102,11 @@ async fn test_l2_to_l1_promotion() {
         .l2_cache
         .as_ref()
         .unwrap_or_else(|| panic!("L2 cache missing"))
-        .set_with_ttl(&key, &serde_json::to_vec(&value).unwrap(), Duration::from_secs(300))
+        .set_with_ttl(
+            &key,
+            &serde_json::to_vec(&value).unwrap(),
+            Duration::from_secs(300),
+        )
         .await
         .unwrap_or_else(|_| panic!("Failed to set L2"));
 

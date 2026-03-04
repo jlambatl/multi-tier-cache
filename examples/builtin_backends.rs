@@ -150,11 +150,7 @@ async fn demo_memcached_backend() -> Result<()> {
 
             // Set with TTL
             memcached
-                .set_with_ttl(
-                    "product:laptop",
-                    &bytes,
-                    Duration::from_secs(300),
-                )
+                .set_with_ttl("product:laptop", &bytes, Duration::from_secs(300))
                 .await?;
 
             // Get the value
@@ -226,11 +222,7 @@ async fn demo_quickcache_backend() -> Result<()> {
     });
 
     manager
-        .set_with_strategy(
-            "session:abc123",
-            &test_data,
-            CacheStrategy::ShortTerm,
-        )
+        .set_with_strategy("session:abc123", &test_data, CacheStrategy::ShortTerm)
         .await?;
 
     if let Some(cached) = manager.get::<serde_json::Value>("session:abc123").await? {

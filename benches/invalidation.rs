@@ -1,11 +1,11 @@
 //! Benchmarks for cache invalidation operations
 
 use criterion::{criterion_group, criterion_main, Criterion};
-use std::hint::black_box;
 use multi_tier_cache::{
     CacheManager, CacheStrategy, InvalidationConfig, L1Cache, L2Cache, MokaCacheConfig,
 };
 use serde_json::json;
+use std::hint::black_box;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::runtime::Runtime;
@@ -85,7 +85,11 @@ fn bench_update_cache(c: &mut Criterion) {
                 let key = format!("bench:upd:{}", rand::random::<u8>() % 100);
                 let new_value = json!({"id": 999, "value": "updated"});
                 let _: () = cache
-                    .update_cache(&key, &new_value, CacheStrategy::Custom(Duration::from_secs(300)))
+                    .update_cache(
+                        &key,
+                        &new_value,
+                        CacheStrategy::Custom(Duration::from_secs(300)),
+                    )
                     .await
                     .unwrap_or_else(|_| panic!("Failed to update"));
                 black_box(());

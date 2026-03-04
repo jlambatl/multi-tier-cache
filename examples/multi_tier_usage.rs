@@ -159,7 +159,10 @@ async fn main() -> Result<()> {
     // 5. Simulate fetching (L1 hit)
     println!("Fetching 'report:2025' (Should be L1 hit)...");
     if let Some(val) = cache.cache_manager().get::<Value>("report:2025").await? {
-        println!("✅ Got value: {}", val.get("product").unwrap_or(&Value::Null));
+        println!(
+            "✅ Got value: {}",
+            val.get("product").unwrap_or(&Value::Null)
+        );
     }
     println!();
 

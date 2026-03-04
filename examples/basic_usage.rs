@@ -36,7 +36,11 @@ async fn main() -> anyhow::Result<()> {
 
     // 4. Retrieve data
     println!("Retrieving user data...");
-    if let Some(cached_user) = cache.cache_manager().get::<serde_json::Value>("user:1").await? {
+    if let Some(cached_user) = cache
+        .cache_manager()
+        .get::<serde_json::Value>("user:1")
+        .await?
+    {
         println!("✅ Retrieved from cache: {cached_user}");
     }
     println!();

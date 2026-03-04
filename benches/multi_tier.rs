@@ -1,9 +1,9 @@
 //! Benchmarks for multi-tier cache operations (v0.5.0+)
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
-use std::hint::black_box;
 use multi_tier_cache::{CacheStrategy, CacheSystem, CacheSystemBuilder, L2Cache, TierConfig};
 use serde_json::json;
+use std::hint::black_box;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::runtime::Runtime;

@@ -2,7 +2,7 @@
 //!
 //! Manages operations across L1 (Moka) and L2 (Redis) caches with intelligent fallback.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use dashmap::DashMap;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -448,82 +448,85 @@ impl<C: CacheCodec> CacheManager<C> {
         key: &str,
         allow_wait: bool,
     ) -> Result<Option<T>> {
-        for (idx, tier) in tiers.iter().enumerate() {
-            // Tier fetch logic
-            let check_tier_fn = || async {
-                if let Some((value, ttl)) = tier.get_with_ttl(key).await {
-                    match self.inner.codec.deserialize(&value) {
-                        Ok(v) => Some((v, value, ttl)),
-                        Err(e) => {
-                            tracing::warn!(
-                                "Cache deserialization failed for key '{}' in L{}: {}",
-                                key,
-                                tier.tier_level,
-                                e
-                            );
-                            None
-                        }
-                    }
-                } else {
-                    None
+        // Fast-path L1 check once
+        let l1 = tiers
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("At least one cache tier is required"))?;
+        if let Some((value, _ttl)) = l1.get_with_ttl(key).await {
+            match self.inner.codec.deserialize(&value) {
+                Ok(v) => {
+                    self.inner.l1_hits.fetch_add(1, Ordering::Relaxed);
+                    l1.record_hit();
+                    return Ok(Some(v));
                 }
-            };
-
-            let mut result = check_tier_fn().await;
-
-            // Hit on L1?
-            if result.is_some() && idx == 0 {
-                self.inner.l1_hits.fetch_add(1, Ordering::Relaxed);
-                tier.record_hit();
-                return Ok(result.map(|(v, _, _)| v));
-            }
-
-            // If this is L1 and we missed, check for stampede
-            if result.is_none() && idx == 0 && allow_wait {
-                let opt_mutex = self
-                    .inner
-                    .in_flight_requests
-                    .get(key)
-                    .map(|r| r.value().clone());
-
-                if let Some(mutex) = opt_mutex {
-                    // Wait for the leader
-                    let _unused = mutex.lock().await;
-                    // Retry L1 check
-                    result = check_tier_fn().await;
-                    if result.is_some() {
-                        self.inner.l1_hits.fetch_add(1, Ordering::Relaxed);
-                        tier.record_hit();
-                        return Ok(result.map(|(v, _, _)| v));
-                    }
+                Err(e) => {
+                    tracing::warn!(
+                        "Cache deserialization failed for key '{}' in L{}: {}",
+                        key,
+                        l1.tier_level,
+                        e
+                    );
                 }
-            }
-
-            if let Some((v, value, ttl)) = result {
-                tier.record_hit();
-
-                // Hit on Lower Tier (L2+) -> Promote to Upper Tiers
-                if idx >= 1 {
-                    self.inner.l2_hits.fetch_add(1, Ordering::Relaxed);
-                }
-
-                if tier.promotion_enabled {
-                    let promo_ttl = ttl.unwrap_or_else(|| CacheStrategy::Default.to_duration());
-                    // Promote to all tiers above this one
-                    for up in tiers.iter().take(idx).rev() {
-                        let _ = up.set_with_ttl(key, &value, promo_ttl).await;
-                        tracing::debug!(
-                            "Promoted '{}' from L{} to L{}",
-                            key,
-                            tier.tier_level,
-                            up.tier_level
-                        );
-                    }
-                    self.inner.promotions.fetch_add(1, Ordering::Relaxed);
-                }
-                return Ok(Some(v));
             }
         }
+
+        // Stampede wait (single pass) for L1 miss
+        if allow_wait {
+            let opt_mutex = self
+                .inner
+                .in_flight_requests
+                .get(key)
+                .map(|r| r.value().clone());
+
+            if let Some(mutex) = opt_mutex {
+                let _unused = mutex.lock().await;
+                if let Some(value) = l1.backend.get(key).await {
+                    if let Ok(v) = self.inner.codec.deserialize(&value) {
+                        self.inner.l1_hits.fetch_add(1, Ordering::Relaxed);
+                        l1.record_hit();
+                        return Ok(Some(v));
+                    }
+                }
+            }
+        }
+
+        // Search lower tiers (L2+)
+        for (idx, tier) in tiers.iter().enumerate().skip(1) {
+            if let Some((value, ttl)) = tier.get_with_ttl(key).await {
+                match self.inner.codec.deserialize(&value) {
+                    Ok(v) => {
+                        tier.record_hit();
+                        self.inner.l2_hits.fetch_add(1, Ordering::Relaxed);
+
+                        if tier.promotion_enabled {
+                            let promo_ttl =
+                                ttl.unwrap_or_else(|| CacheStrategy::Default.to_duration());
+                            for up in tiers.iter().take(idx).rev() {
+                                let _ = up.set_with_ttl(key, &value, promo_ttl).await;
+                                tracing::debug!(
+                                    "Promoted '{}' from L{} to L{}",
+                                    key,
+                                    tier.tier_level,
+                                    up.tier_level
+                                );
+                            }
+                            self.inner.promotions.fetch_add(1, Ordering::Relaxed);
+                        }
+
+                        return Ok(Some(v));
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Cache deserialization failed for key '{}' in L{}: {}",
+                            key,
+                            tier.tier_level,
+                            e
+                        );
+                    }
+                }
+            }
+        }
+
         Ok(None)
     }
 
@@ -679,6 +682,21 @@ impl<C: CacheCodec> CacheManager<C> {
     /// 6. **Fill**: Store result in L1 & L2 with `strategy` TTL.
     /// 7. **Release**: Release lock to unblock other readers.
     ///
+    /// # ⚠️  Important: Async I/O Requirements
+    ///
+    /// **The `compute_fn` MUST be async I/O-bound work** (e.g., database queries,
+    /// HTTP requests, file reads). Never use `compute_fn` for CPU-bound work like
+    /// JSON parsing, image processing, or cryptography.
+    ///
+    /// **Why?** Tokio's async runtime has a limited thread pool. Blocking threads
+    /// with CPU-intensive work will **starve** other async tasks, causing:
+    /// - Increased latency for concurrent requests
+    /// - Potential deadlocks under high load
+    /// - Poor scalability
+    ///
+    /// **For CPU-bound work:** Use `get_or_compute_blocking()` instead, which spawns
+    /// compute tasks on Tokio's blocking thread pool.
+    ///
     /// # Type Parameters
     ///
     /// * `F`: Compute function returning a Future.
@@ -688,9 +706,9 @@ impl<C: CacheCodec> CacheManager<C> {
     ///
     /// * `key` - The cache key.
     /// * `strategy` - TTL strategy for storing the computed value.
-    /// * `compute_fn` - An async closure to call if the key is missing.
+    /// * `compute_fn` - An async closure to call if the key is missing (MUST be I/O-bound).
     ///
-    /// # Example: API Call
+    /// # Example: API Call (I/O-Bound - CORRECT ✅)
     ///
     /// ```rust,no_run
     /// # use multi_tier_cache::*;
@@ -701,11 +719,23 @@ impl<C: CacheCodec> CacheManager<C> {
     ///
     /// // Only ONE request will hit the API even if 1000 requests arrive concurrently
     /// let user = cache.get_or_compute(&key, CacheStrategy::ShortTerm, || {
-    ///     async move { fetch_user_api(user_id).await }
+    ///     async move { fetch_user_api(user_id).await }  // ✅ Async I/O
     /// }).await?;
     /// # Ok(())
     /// # }
     /// ```
+    ///
+    /// # Example: CPU-Bound Work - ❌ WRONG (blocks runtime)
+    ///
+    /// ```rust,ignore
+    /// // ❌ BAD: Blocks async runtime with synchronous CPU work
+    /// let digest = cache.get_or_compute(&key, CacheStrategy::Default, || async {
+    ///     let data = std::fs::read("large_file.bin")?;  // ❌ Sync I/O
+    ///     compute_sha256(&data)  // ❌ Blocks thread with crypto
+    /// }).await?;
+    /// ```
+    ///
+    /// Use `get_or_compute_blocking()` for CPU-bound work instead (see below).
     pub async fn get_or_compute<T, F, Fut>(
         &self,
         key: &str,
@@ -741,6 +771,120 @@ impl<C: CacheCodec> CacheManager<C> {
         }
 
         let val = compute_fn().await?;
+        self.set_with_strategy(key, &val, strategy).await?;
+        Ok(val)
+    }
+
+    /// Retrieve a value or compute it if missing (CPU-Bound, Blocking-Friendly).
+    ///
+    /// Similar to `get_or_compute()`, but spawns the `compute_fn` on Tokio's
+    /// **blocking thread pool** using `tokio::task::spawn_blocking`. This prevents
+    /// CPU-intensive work from starving async tasks.
+    ///
+    /// Use this for:
+    /// - Heavy JSON parsing or serialization
+    /// - Image/video processing
+    /// - Cryptographic operations (hashing, signing)
+    /// - Compression/decompression
+    /// - Large dataset transformations
+    ///
+    /// # Performance Note
+    ///
+    /// Spawning on the blocking pool has overhead (~10-50µs). Only use this for
+    /// work that takes **>1ms** of CPU time. For fast pure computations (<1ms),
+    /// inline execution may be faster.
+    ///
+    /// # Type Parameters
+    ///
+    /// * `F`: Compute function (sync closure).
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - The cache key.
+    /// * `strategy` - TTL strategy for storing the computed value.
+    /// * `compute_fn` - A **synchronous** closure (CPU-bound work).
+    ///
+    /// # Example: Image Processing (CPU-Bound - CORRECT ✅)
+    ///
+    /// ```rust,no_run
+    /// # use multi_tier_cache::*;
+    /// # use anyhow::Result;
+    /// # fn expensive_image_resize(data: &[u8]) -> Result<Vec<u8>> { Ok(vec![]) }
+    /// # async fn example(cache: CacheManager) -> Result<()> {
+    /// let key = "thumbnail:image123.jpg";
+    ///
+    /// // Offloads CPU-bound work to blocking thread pool
+    /// let thumbnail = cache.get_or_compute_blocking(
+    ///     key,
+    ///     CacheStrategy::LongTerm,
+    ///     || {
+    ///         // ✅ Runs on dedicated blocking thread
+    ///         let img_data = std::fs::read("image123.jpg")?;
+    ///         expensive_image_resize(&img_data)
+    ///     }
+    /// ).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Example: Cryptography (CPU-Bound - CORRECT ✅)
+    ///
+    /// ```rust,no_run
+    /// # use multi_tier_cache::*;
+    /// # use anyhow::Result;
+    /// # fn compute_sha256(data: &[u8]) -> Vec<u8> { vec![] }
+    /// # async fn example(cache: CacheManager) -> Result<()> {
+    /// let key = "hash:large_file.bin";
+    ///
+    /// let digest = cache.get_or_compute_blocking(
+    ///     key,
+    ///     CacheStrategy::Default,
+    ///     || {
+    ///         let data = std::fs::read("large_file.bin")?;  // ✅ Blocking I/O is OK here
+    ///         Ok(compute_sha256(&data))  // ✅ CPU-bound crypto
+    ///     }
+    /// ).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn get_or_compute_blocking<T, F>(
+        &self,
+        key: &str,
+        strategy: CacheStrategy,
+        compute_fn: F,
+    ) -> Result<T>
+    where
+        T: Serialize + DeserializeOwned + Send + 'static,
+        F: FnOnce() -> Result<T> + Send + 'static,
+    {
+        if let Some(val) = self.get(key).await? {
+            return Ok(val);
+        }
+
+        // Compute lock
+        let key_arc: Arc<str> = Arc::from(key);
+        let lock_guard = self
+            .inner
+            .in_flight_requests
+            .entry(Arc::clone(&key_arc))
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone();
+        let _guard = lock_guard.lock().await;
+        let _cleanup = CleanupGuard {
+            map: &self.inner.in_flight_requests,
+            key: key_arc,
+        };
+
+        // Double check
+        if let Some(val) = self.get_internal(key, false).await? {
+            return Ok(val);
+        }
+
+        // Spawn compute_fn on blocking thread pool
+        let val = tokio::task::spawn_blocking(compute_fn)
+            .await
+            .context("Blocking compute task panicked or was cancelled")??;
+
         self.set_with_strategy(key, &val, strategy).await?;
         Ok(val)
     }

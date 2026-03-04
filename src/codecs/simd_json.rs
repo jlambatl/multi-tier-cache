@@ -25,7 +25,8 @@ impl CacheCodec for SimdJsonCodec {
     fn deserialize<T: DeserializeOwned>(&self, bytes: &[u8]) -> Result<T> {
         // simd_json modifies the buffer in place for performance
         let mut bytes_copy = bytes.to_vec();
-        simd_json::from_slice(&mut bytes_copy).map_err(|e| anyhow::anyhow!("SimdJson deserialization failed: {e}"))
+        simd_json::from_slice(&mut bytes_copy)
+            .map_err(|e| anyhow::anyhow!("SimdJson deserialization failed: {e}"))
     }
 
     fn name(&self) -> &'static str {
