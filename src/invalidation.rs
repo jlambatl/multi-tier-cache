@@ -500,11 +500,8 @@ mod tests {
         }
 
         // Test Update
-        let msg = InvalidationMessage::update(
-            "test_key",
-            vec![1, 2, 3],
-            Some(Duration::from_secs(300)),
-        );
+        let msg =
+            InvalidationMessage::update("test_key", vec![1, 2, 3], Some(Duration::from_secs(300)));
         let json = msg.to_json()?;
         let parsed = InvalidationMessage::from_json(&json)?;
         match parsed {

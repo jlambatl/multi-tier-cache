@@ -19,11 +19,13 @@ impl PostcardCodec {
 
 impl CacheCodec for PostcardCodec {
     fn serialize<T: Serialize + ?Sized>(&self, value: &T) -> Result<Vec<u8>> {
-        postcard::to_allocvec(value).map_err(|e| anyhow::anyhow!("Postcard serialization failed: {e}"))
+        postcard::to_allocvec(value)
+            .map_err(|e| anyhow::anyhow!("Postcard serialization failed: {e}"))
     }
 
     fn deserialize<T: DeserializeOwned>(&self, bytes: &[u8]) -> Result<T> {
-        postcard::from_bytes(bytes).map_err(|e| anyhow::anyhow!("Postcard deserialization failed: {e}"))
+        postcard::from_bytes(bytes)
+            .map_err(|e| anyhow::anyhow!("Postcard deserialization failed: {e}"))
     }
 
     fn name(&self) -> &'static str {

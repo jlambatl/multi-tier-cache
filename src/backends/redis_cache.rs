@@ -20,6 +20,7 @@ use crate::utils::redact_url;
 /// - Automatic reconnection via `ConnectionManager`
 /// - TTL introspection for cache promotion
 /// - Pattern-based key scanning
+/// - Memory limit enforcement with configurable eviction policies
 pub struct RedisCache {
     /// Redis connection manager - handles reconnection automatically
     conn_manager: ConnectionManager,
@@ -29,6 +30,30 @@ pub struct RedisCache {
     misses: Arc<AtomicU64>,
     /// Set counter
     sets: Arc<AtomicU64>,
+    /// Optional memory limit (in bytes) - if set, configures Redis maxmemory
+    #[allow(dead_code)]
+    max_memory: Option<u64>,
+}
+
+/// Configuration for Redis memory management
+#[derive(Debug, Clone)]
+pub struct RedisMemoryConfig {
+    /// Maximum memory in bytes (e.g., 1GB = `1_073_741_824`)
+    pub max_memory_bytes: u64,
+    /// Eviction policy when maxmemory is reached
+    /// Options: "noeviction", "allkeys-lru", "volatile-lru", "allkeys-lfu", "volatile-lfu",
+    /// "allkeys-random", "volatile-random", "volatile-ttl"
+    /// Default: "allkeys-lru"
+    pub eviction_policy: String,
+}
+
+impl Default for RedisMemoryConfig {
+    fn default() -> Self {
+        Self {
+            max_memory_bytes: 1_073_741_824, // 1GB default
+            eviction_policy: "allkeys-lru".to_string(),
+        }
+    }
 }
 
 impl RedisCache {
@@ -51,6 +76,39 @@ impl RedisCache {
     ///
     /// Returns an error if the Redis client cannot be created or connection fails.
     pub async fn with_url(redis_url: &str) -> Result<Self> {
+        Self::with_url_and_memory_config(redis_url, None).await
+    }
+
+    /// Create new Redis cache with custom URL and memory limits
+    ///
+    /// # Arguments
+    ///
+    /// * `redis_url` - Redis connection string (e.g., `<redis://localhost:6379>`)
+    /// * `memory_config` - Optional memory limit and eviction policy configuration
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use multi_tier_cache::backends::{RedisCache, RedisMemoryConfig};
+    /// # async fn example() -> anyhow::Result<()> {
+    /// let config = RedisMemoryConfig {
+    ///     max_memory_bytes: 2_147_483_648, // 2GB
+    ///     eviction_policy: "allkeys-lru".to_string(),
+    /// };
+    /// let cache = RedisCache::with_url_and_memory_config(
+    ///     "redis://127.0.0.1:6379",
+    ///     Some(config)
+    /// ).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    /// # Errors
+    ///
+    /// Returns an error if the Redis client cannot be created or connection fails.
+    pub async fn with_url_and_memory_config(
+        redis_url: &str,
+        memory_config: Option<RedisMemoryConfig>,
+    ) -> Result<Self> {
         info!(redis_url = %redact_url(redis_url), "Initializing Redis Cache with ConnectionManager");
 
         let client = Client::open(redis_url).with_context(|| {
@@ -72,6 +130,42 @@ impl RedisCache {
             .await
             .context("Redis PING health check failed")?;
 
+        // Configure memory limits if provided
+        let max_memory = if let Some(config) = memory_config {
+            info!(
+                max_memory_mb = config.max_memory_bytes / 1_048_576,
+                policy = %config.eviction_policy,
+                "Configuring Redis memory limits"
+            );
+
+            // Set maxmemory
+            let _: () = redis::cmd("CONFIG")
+                .arg("SET")
+                .arg("maxmemory")
+                .arg(config.max_memory_bytes)
+                .query_async(&mut conn)
+                .await
+                .context("Failed to set Redis maxmemory")?;
+
+            // Set maxmemory-policy
+            let _: () = redis::cmd("CONFIG")
+                .arg("SET")
+                .arg("maxmemory-policy")
+                .arg(&config.eviction_policy)
+                .query_async(&mut conn)
+                .await
+                .with_context(|| {
+                    format!(
+                        "Failed to set Redis maxmemory-policy to {}",
+                        config.eviction_policy
+                    )
+                })?;
+
+            Some(config.max_memory_bytes)
+        } else {
+            None
+        };
+
         info!(redis_url = %redact_url(redis_url), "Redis Cache connected successfully (ConnectionManager enabled)");
 
         Ok(Self {
@@ -79,7 +173,70 @@ impl RedisCache {
             hits: Arc::new(AtomicU64::new(0)),
             misses: Arc::new(AtomicU64::new(0)),
             sets: Arc::new(AtomicU64::new(0)),
+            max_memory,
         })
+    }
+
+    /// Get current memory usage statistics from Redis
+    ///
+    /// # Returns
+    ///
+    /// Tuple of (`used_memory_bytes`, `max_memory_bytes`, `memory_fragmentation_ratio`)
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the Redis INFO command fails
+    pub async fn get_memory_stats(&self) -> Result<(u64, u64, f64)> {
+        let mut conn = self.conn_manager.clone();
+
+        let info: String = redis::cmd("INFO")
+            .arg("memory")
+            .query_async(&mut conn)
+            .await
+            .context("Failed to get Redis INFO memory")?;
+
+        // Parse used_memory, maxmemory, and fragmentation ratio from INFO output
+        let mut used_memory: u64 = 0;
+        let mut max_memory: u64 = 0;
+        let mut fragmentation_ratio: f64 = 1.0;
+
+        for line in info.lines() {
+            if let Some(value) = line.strip_prefix("used_memory:") {
+                used_memory = value.trim().parse().unwrap_or(0);
+            } else if let Some(value) = line.strip_prefix("maxmemory:") {
+                max_memory = value.trim().parse().unwrap_or(0);
+            } else if let Some(value) = line.strip_prefix("mem_fragmentation_ratio:") {
+                fragmentation_ratio = value.trim().parse().unwrap_or(1.0);
+            }
+        }
+
+        Ok((used_memory, max_memory, fragmentation_ratio))
+    }
+
+    /// Check if memory usage is approaching the configured limit
+    ///
+    /// # Arguments
+    ///
+    /// * `threshold` - Percentage threshold (0.0-1.0). For example, 0.8 means 80% full
+    ///
+    /// # Returns
+    ///
+    /// `true` if memory usage is above the threshold, `false` otherwise
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if memory stats cannot be retrieved
+    pub async fn is_memory_pressure(&self, threshold: f64) -> Result<bool> {
+        let (used, max, _) = self.get_memory_stats().await?;
+
+        if max == 0 {
+            // No memory limit configured
+            return Ok(false);
+        }
+
+        #[allow(clippy::cast_precision_loss)]
+        let usage_ratio = used as f64 / max as f64;
+        Ok(usage_ratio >= threshold)
     }
 
     /// Scan keys matching a pattern (glob-style: *, ?, [])

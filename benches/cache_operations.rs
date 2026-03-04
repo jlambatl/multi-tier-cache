@@ -9,9 +9,9 @@
 //! - Different data sizes
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
-use std::hint::black_box;
 use multi_tier_cache::{CacheBackend, CacheStrategy, CacheSystem};
 use serde_json::json;
+use std::hint::black_box;
 use std::time::Duration;
 use tokio::runtime::Runtime;
 
@@ -124,9 +124,13 @@ fn bench_l2_hit(c: &mut Criterion) {
         for i in 0..100 {
             let key = format!("bench:l2:{i}");
             if let Some(l2) = &cache.l2_cache {
-                l2.set_with_ttl(&key, &serde_json::to_vec(&test_data(1024)).unwrap(), Duration::from_secs(300))
-                    .await
-                    .unwrap_or_else(|_| panic!("Failed to set cache"));
+                l2.set_with_ttl(
+                    &key,
+                    &serde_json::to_vec(&test_data(1024)).unwrap(),
+                    Duration::from_secs(300),
+                )
+                .await
+                .unwrap_or_else(|_| panic!("Failed to set cache"));
             }
         }
     });
@@ -247,13 +251,9 @@ fn bench_typed_cache(c: &mut Criterion) {
                 black_box(
                     cache
                         .cache_manager()
-                        .get_or_compute::<User, _, _>(
-                            &key,
-                            CacheStrategy::ShortTerm,
-                            || async {
-                                panic!("Should not compute");
-                            },
-                        )
+                        .get_or_compute::<User, _, _>(&key, CacheStrategy::ShortTerm, || async {
+                            panic!("Should not compute");
+                        })
                         .await
                         .unwrap_or_else(|_| panic!("Failed to get/compute typed")),
                 );

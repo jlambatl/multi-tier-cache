@@ -17,11 +17,7 @@ async fn test_real_time_strategy_expiry() -> anyhow::Result<()> {
     // 1. Set with RealTime strategy (10s ideally, but we test expiration logic)
     // We use Custom for faster test execution
     manager
-        .set_with_strategy(
-            &key,
-            &value,
-            CacheStrategy::Custom(Duration::from_secs(1)),
-        )
+        .set_with_strategy(&key, &value, CacheStrategy::Custom(Duration::from_secs(1)))
         .await?;
 
     // 2. Verify immediate retrieval

@@ -202,12 +202,7 @@ impl CacheBackend for NoOpCache {
         None // Always miss
     }
 
-    async fn set_with_ttl(
-        &self,
-        key: &str,
-        _value: &[u8],
-        ttl: Duration,
-    ) -> Result<()> {
+    async fn set_with_ttl(&self, key: &str, _value: &[u8], ttl: Duration) -> Result<()> {
         println!(
             "💾 [{}] Would cache '{}' with TTL {:?} (no-op)",
             self.name, key, ttl

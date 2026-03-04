@@ -21,7 +21,7 @@ pub struct CacheSystemBuilder<C: CacheCodec = JsonCodec> {
 
     // Multi-tier configuration
     tiers: Vec<(Arc<dyn L2CacheBackend>, TierConfig)>,
-    
+
     // Codec
     codec: C,
 }
@@ -44,7 +44,10 @@ impl CacheSystemBuilder<JsonCodec> {
 impl<C: CacheCodec + Clone + 'static> CacheSystemBuilder<C> {
     /// Configure custom codec
     #[must_use]
-    pub fn with_codec<NewC: CacheCodec + Clone + 'static>(self, codec: NewC) -> CacheSystemBuilder<NewC> {
+    pub fn with_codec<NewC: CacheCodec + Clone + 'static>(
+        self,
+        codec: NewC,
+    ) -> CacheSystemBuilder<NewC> {
         CacheSystemBuilder {
             l1_backend: self.l1_backend,
             l2_backend: self.l2_backend,
@@ -106,11 +109,17 @@ impl<C: CacheCodec + Clone + 'static> CacheSystemBuilder<C> {
 
     /// Build the `CacheSystem` with configured or default backends
     pub async fn build(self) -> Result<CacheSystem<C>> {
-        info!("Building Multi-Tier Cache System (Codec: {})", self.codec.name());
+        info!(
+            "Building Multi-Tier Cache System (Codec: {})",
+            self.codec.name()
+        );
 
         // Multi-tier mode
         if !self.tiers.is_empty() {
-            info!(tier_count = self.tiers.len(), "Initializing multi-tier architecture");
+            info!(
+                tier_count = self.tiers.len(),
+                "Initializing multi-tier architecture"
+            );
 
             let mut tiers = self.tiers;
             tiers.sort_by_key(|(_, config)| config.tier_level);
@@ -127,7 +136,7 @@ impl<C: CacheCodec + Clone + 'static> CacheSystemBuilder<C> {
                 })
                 .collect();
 
-            // Note: CacheManager constructors now take ownership of codec if not Copy, or clone. 
+            // Note: CacheManager constructors now take ownership of codec if not Copy, or clone.
             // CacheManager::with_tiers_and_codec takes C.
             let cache_manager = CacheManager::with_tiers_and_codec(
                 cache_tiers,
@@ -156,11 +165,12 @@ impl<C: CacheCodec + Clone + 'static> CacheSystemBuilder<C> {
             // We'll construct backends and use with_codec.
             let l1_backend: Arc<dyn CacheBackend> = l1_cache.clone();
             let l2_backend: Arc<dyn L2CacheBackend> = l2_cache.clone();
-            
+
             // Check if L2 implements StreamingBackend (RedisCache does)
             // But we don't have upcasting.
             // We'll use RedisStreams if we built default L2.
-            let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+            let redis_url =
+                std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
             let redis_streams = crate::redis_streams::RedisStreams::new(&redis_url).await?;
             let streaming_backend: Arc<dyn StreamingBackend> = Arc::new(redis_streams);
 

@@ -461,13 +461,17 @@ async fn test_stampede_retrieves_from_l3() {
 
         tasks.spawn(async move {
             manager_clone
-                .get_or_compute::<serde_json::Value, _, _>(&key_clone, CacheStrategy::ShortTerm, || {
-                    counter_clone.fetch_add(1, Ordering::SeqCst);
-                    async move {
-                        // This should NEVER be called since data is in L3
-                        panic!("Compute should not be called when data exists in L3!");
-                    }
-                })
+                .get_or_compute::<serde_json::Value, _, _>(
+                    &key_clone,
+                    CacheStrategy::ShortTerm,
+                    || {
+                        counter_clone.fetch_add(1, Ordering::SeqCst);
+                        async move {
+                            // This should NEVER be called since data is in L3
+                            panic!("Compute should not be called when data exists in L3!");
+                        }
+                    },
+                )
                 .await
         });
     }
@@ -490,11 +494,7 @@ async fn test_stampede_retrieves_from_l3() {
     let l1_data = l1.get(&key).await;
     assert!(l1_data.is_some(), "Data should be promoted from L3 to L1");
     let l1_val: serde_json::Value = serde_json::from_slice(&l1_data.unwrap()).unwrap();
-    assert_eq!(
-        l1_val,
-        data,
-        "Promoted data should match original"
-    );
+    assert_eq!(l1_val, data, "Promoted data should match original");
 
     println!("✅ Stampede retrieves from L3 test passed");
 }
